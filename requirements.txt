@@ -1,0 +1,22 @@
+# FastAPI and ASGI server
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Data validation
+pydantic
+
+# Environment and config
+python-dotenv
+
+# HTTP client (for calling AgenticAPI)
+httpx
+
+# MongoDB
+pymongo
+
+# Google Gemini
+google-generativeai
+
+# JWT authentication
+PyJWT

@@ -1,0 +1,25 @@
+services:
+  omnidoc-router-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/ai-shubham-mishra/omnidoc-router:dev
+    restart: always
+    ports:
+      - "8501:8500"
+    volumes:
+      - ./tmp:/app/tmp
+      - /opt/config:/opt/config
+    env_file:
+      - /opt/config/omnidoc-router-dev.env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;\ntry:\n r=urllib.request.urlopen('http://127.0.0.1:8500/health', timeout=2);\n sys.exit(0 if r.status==200 else 1)\nexcept Exception:\n sys.exit(1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

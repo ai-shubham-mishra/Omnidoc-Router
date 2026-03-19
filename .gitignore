@@ -1,2 +1,18 @@
 .env
 *test
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# Temp files
+tmp/
+
+# IDE
+.vscode/
+.idea/
