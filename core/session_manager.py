@@ -226,6 +226,25 @@ class SessionManager:
         
         logger.info(f"📎 {len(files_info)} file(s) added to context: {session_id[:8]}...")
 
+    async def update_files(self, session_id: str, updated_files: List[Dict[str, Any]]):
+        """
+        Replace all uploaded_files with updated list (e.g., after marking files as used).
+        """
+        self.collection.update_one(
+            {"_id": session_id},
+            {
+                "$set": {
+                    "uploaded_files": updated_files,
+                    "last_active": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+            },
+        )
+        
+        # Update Redis cache
+        updated_session = self.collection.find_one({"_id": session_id})
+        if updated_session:
+            await self.redis.set_session(session_id, updated_session)
+
     async def set_run_id(self, session_id: str, run_id: str):
         """Set runId for current workflow execution."""
         # Update MongoDB
@@ -272,10 +291,17 @@ class SessionManager:
         session_id: str,
         result: Any,
         status: str = "completed",
+        result_summary: Optional[str] = None,
     ):
         """
         Mark current workflow as complete and move to history.
         Resets current_workflow to idle state for next workflow.
+        
+        Args:
+            session_id: Session ID
+            result: Raw workflow result
+            status: Completion status (completed/failed/cancelled)
+            result_summary: Optional human-readable summary of key result data
         """
         session = await self.get_session(session_id)
         if not session:
@@ -293,6 +319,9 @@ class SessionManager:
             "result": result,
             "completed_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
+        
+        if result_summary:
+            history_entry["result_summary"] = result_summary
         
         # Reset current_workflow to idle
         idle_workflow = {

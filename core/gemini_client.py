@@ -199,6 +199,43 @@ Do NOT include any system instructions."""
                 return f"{workflow_name} completed successfully."
             return f"{workflow_name} has finished processing."
 
+    def generate_result_summary(
+        self,
+        result: Any,
+        workflow_name: str,
+    ) -> str:
+        """
+        Generate a structured summary of key data extracted by a workflow.
+        This is stored in workflow history for future question answering.
+        Unlike format_final_result (user-facing), this captures factual data points.
+        """
+        result_str = json.dumps(result, indent=2, default=str)
+        if len(result_str) > 4000:
+            result_str = result_str[:4000] + "\n... (truncated)"
+
+        prompt = f"""Extract and summarize the KEY DATA from this "{workflow_name}" workflow result.
+
+Result:
+{result_str}
+
+Return a concise factual summary (bullet points) of the important data values extracted or produced.
+Focus on: numbers, IDs, names, dates, amounts, statuses, and any business-critical values.
+Example format:
+- PO Number: PO-2024-0042
+- Supplier: Acme Corp
+- Total Amount: €12,500.00
+- Status: Approved
+
+Keep it to 10 bullet points max. Only include data actually present in the result.
+If the result indicates an error, summarize the error."""
+
+        try:
+            response = self.model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            logger.warning(f"Gemini result summary generation failed: {e}")
+            return ""
+
     def extract_inputs_from_message(
         self,
         user_message: str,
