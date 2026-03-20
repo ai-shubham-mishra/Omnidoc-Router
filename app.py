@@ -1,6 +1,7 @@
-from fastapi import FastAPI, Request, Depends
+from fastapi import FastAPI, Request, Depends, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional, List
 import logging
 
 from auth.middleware import JWTAuthMiddleware
@@ -10,11 +11,14 @@ from auth.dependencies import get_current_user
 from core.orchestrator import RouterOrchestrator
 from models.api_contracts import (
     ChatRequest,
+    MessageRequest,
     ConfirmationRequest,
     RouterResponse,
     ErrorDetail,
+    FileUploaded,
 )
 from utils.config import API_VERSION, LAST_UPDATED
+from utils.redis_client import redis_client
 
 from dotenv import load_dotenv
 
@@ -22,13 +26,13 @@ load_dotenv()
 
 # Configure logging
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
 app = FastAPI(
     title="Omnidoc Router",
-    description="LLM-powered chat router for Omnidoc workflows",
+    description="LLM-powered conversational workflow orchestrator with Redis caching",
     version=API_VERSION,
 )
 
@@ -51,7 +55,56 @@ app.add_middleware(
 router_orchestrator = RouterOrchestrator()
 
 
+# ============== Lifecycle Events ==============
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize Redis connection on startup."""
+    await redis_client.connect()
+    logging.info(f"🚀 Omnidoc Router v{API_VERSION} started")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close Redis connection on shutdown."""
+    await redis_client.close()
+    logging.info("👋 Omnidoc Router shutdown")
+
+
 # ============== Router Endpoints ==============
+
+@app.post("/api/router/message", response_model=RouterResponse)
+async def router_message(
+    request: Request,
+    session_id: Optional[str] = Form(None),
+    message: str = Form(""),
+    files: List[UploadFile] = File([]),
+    user_context: UserContext = Depends(get_current_user),
+):
+    """
+    Unified endpoint for conversational workflow orchestration.
+    Accepts multipart/form-data with message + files in single request.
+    
+    - Send message to chat
+    - Upload files to session context
+    - Or both simultaneously
+    
+    This is the recommended endpoint (replaces /chat and /upload).
+    """
+    user_id = user_context.user_id
+    org_id = user_context.raw_payload.get("organizationId", "")
+    jwt_token = request.headers.get("Authorization", "")
+
+    result = await router_orchestrator.handle_message(
+        message=message,
+        session_id=session_id,
+        files=files if files else [],
+        user_id=user_id,
+        org_id=org_id,
+        jwt_token=jwt_token,
+    )
+    return result
+
 
 @app.post("/api/router/chat", response_model=RouterResponse)
 async def router_chat(
@@ -163,7 +216,7 @@ async def router_delete_session(
     user_context: UserContext = Depends(get_current_user),
 ):
     """Delete a chat session."""
-    deleted = router_orchestrator.delete_session(session_id, user_context.user_id)
+    deleted = await router_orchestrator.delete_session(session_id, user_context.user_id)
     if not deleted:
         return JSONResponse(
             content={"status": "error", "message": "Session not found or access denied"},

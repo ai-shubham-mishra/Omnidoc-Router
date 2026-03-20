@@ -15,6 +15,10 @@ httpx
 # MongoDB
 pymongo
 
+# Redis (for session caching)
+redis[hiredis]
+aioredis
+
 # Google Gemini
 google-generativeai
 

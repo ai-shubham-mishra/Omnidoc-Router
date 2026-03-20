@@ -9,14 +9,21 @@ from typing import Optional, List, Dict, Any
 # ============== Request Models ==============
 
 class ChatRequest(BaseModel):
-    """Request body for POST /api/router/chat"""
+    """Request body for POST /api/router/chat (legacy, use MessageRequest instead)"""
     session_id: Optional[str] = Field(None, description="Existing session ID or null for new conversation")
     message: str = Field(..., description="User's natural language message")
 
 
-class UploadFieldName(BaseModel):
-    """Field name mapping for file uploads"""
-    field_name: str = Field(default="files", description="Which input field these files belong to")
+class MessageRequest(BaseModel):
+    """
+    Request body for POST /api/router/message (unified endpoint).
+    Note: When using multipart/form-data, these become form fields:
+    - session_id: string (optional)
+    - message: string (required, can be empty if just uploading files)
+    - files: file[] (optional, multiple files)
+    """
+    session_id: Optional[str] = Field(None, description="Existing session ID or null for new conversation")
+    message: str = Field("", description="User's natural language message (can be empty for file-only uploads)")
 
 
 class ConfirmationRequest(BaseModel):
@@ -27,6 +34,14 @@ class ConfirmationRequest(BaseModel):
 
 
 # ============== Response Models ==============
+
+class FileUploaded(BaseModel):
+    """Uploaded file metadata"""
+    file_id: str
+    original_name: str
+    mime_type: str
+    size_bytes: int
+    uploaded_at: str
 
 class WorkflowIdentified(BaseModel):
     """Workflow identification info in responses"""
@@ -61,21 +76,23 @@ class ErrorDetail(BaseModel):
 class RouterResponse(BaseModel):
     """
     Standardized response for all router endpoints.
-    All fields except session_id, status, response are optional.
+    Unified response for chat, message, and file upload.
     """
     session_id: Optional[str] = None
-    status: str = Field(..., description="collecting | executing | awaiting_confirmation | completed | failed | cancelled")
+    status: str = Field(..., description="idle | collecting | ready_to_execute | executing | awaiting_confirmation | completed | failed | cancelled")
     response: str = Field(..., description="Natural language message for user")
 
     workflow_identified: Optional[WorkflowIdentified] = None
     inputs_required: Optional[List[InputRequired]] = None
-    files_uploaded: Optional[int] = None
+    
+    # File upload info
+    files_uploaded: Optional[List[FileUploaded]] = None
+    total_session_files: Optional[int] = None  # Total files in session context
 
     requires_confirmation: Optional[bool] = None
     confirmation_data: Optional[ConfirmationData] = None
 
     final_result: Optional[Any] = None
-
     error: Optional[ErrorDetail] = None
 
 
@@ -84,12 +101,13 @@ class SessionResponse(BaseModel):
     session_id: str
     user_id: str
     org_id: str
+    status: str  # Always "active" in new design
     created_at: str
-    updated_at: str
-    status: str
+    last_active: str
     conversation_history: List[Dict[str, Any]]
-    workflow_context: Optional[Dict[str, Any]] = None
-    execution_context: Optional[Dict[str, Any]] = None
+    current_workflow: Dict[str, Any]
+    workflow_history: List[Dict[str, Any]]
+    uploaded_files: List[Dict[str, Any]]
 
 
 class DeleteSessionResponse(BaseModel):
