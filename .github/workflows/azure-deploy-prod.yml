@@ -54,11 +54,23 @@ jobs:
       - name: Get ACR Credentials
         id: acr-creds
         run: |
+          # Ensure admin is enabled
+          az acr update --name ${{ env.ACR_NAME }} --admin-enabled true
+          
+          # Wait a moment for admin to be fully enabled
+          sleep 5
+          
+          # Get credentials
           ACR_USERNAME=$(az acr credential show --name ${{ env.ACR_NAME }} --query username -o tsv)
           ACR_PASSWORD=$(az acr credential show --name ${{ env.ACR_NAME }} --query passwords[0].value -o tsv)
+          ACR_LOGIN_SERVER=$(az acr show --name ${{ env.ACR_NAME }} --query loginServer -o tsv)
+          
           echo "::add-mask::$ACR_PASSWORD"
           echo "ACR_USERNAME=$ACR_USERNAME" >> $GITHUB_OUTPUT
           echo "ACR_PASSWORD=$ACR_PASSWORD" >> $GITHUB_OUTPUT
+          echo "ACR_LOGIN_SERVER=$ACR_LOGIN_SERVER" >> $GITHUB_OUTPUT
+          
+          echo "ACR Login Server: $ACR_LOGIN_SERVER"
 
       - name: Deploy to Azure Container Apps
         run: |
@@ -77,10 +89,10 @@ jobs:
                 --name ${{ env.CONTAINER_APP_NAME }} \
                 --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
                 --environment ${{ env.CONTAINER_APP_ENV }} \
-                --image ${{ env.ACR_NAME }}.azurecr.io/omnidoc-router:latest \
+                --image ${{ steps.acr-creds.outputs.ACR_LOGIN_SERVER }}/omnidoc-router:latest \
                 --target-port 8500 \
                 --ingress external \
-                --registry-server ${{ env.ACR_NAME }}.azurecr.io \
+                --registry-server ${{ steps.acr-creds.outputs.ACR_LOGIN_SERVER }} \
                 --registry-username ${{ steps.acr-creds.outputs.ACR_USERNAME }} \
                 --registry-password ${{ steps.acr-creds.outputs.ACR_PASSWORD }} \
                 --cpu 0.5 \
@@ -101,14 +113,14 @@ jobs:
               az containerapp registry set \
                 --name ${{ env.CONTAINER_APP_NAME }} \
                 --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-                --server ${{ env.ACR_NAME }}.azurecr.io \
+                --server ${{ steps.acr-creds.outputs.ACR_LOGIN_SERVER }} \
                 --username ${{ steps.acr-creds.outputs.ACR_USERNAME }} \
                 --password ${{ steps.acr-creds.outputs.ACR_PASSWORD }}
               
               az containerapp update \
                 --name ${{ env.CONTAINER_APP_NAME }} \
                 --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-                --image ${{ env.ACR_NAME }}.azurecr.io/omnidoc-router:latest \
+                --image ${{ steps.acr-creds.outputs.ACR_LOGIN_SERVER }}/omnidoc-router:latest \
                 --set-env-vars "AGENTICAPI_BASE_URL=${{ secrets.AGENTICAPI_BASE_URL }}"
             fi
           else
