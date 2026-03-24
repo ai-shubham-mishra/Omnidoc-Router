@@ -41,12 +41,24 @@ jobs:
 
       - name: Build and push to Azure Container Registry
         run: |
+          # Enable admin credentials on ACR
+          az acr update --name ${{ env.ACR_NAME }} --admin-enabled true
+          
           az acr build \
             --registry ${{ env.ACR_NAME }} \
             --image omnidoc-router:latest \
             --image omnidoc-router:${{ github.sha }} \
             --file ./Dockerfile \
             .
+
+      - name: Get ACR Credentials
+        id: acr-creds
+        run: |
+          ACR_USERNAME=$(az acr credential show --name ${{ env.ACR_NAME }} --query username -o tsv)
+          ACR_PASSWORD=$(az acr credential show --name ${{ env.ACR_NAME }} --query passwords[0].value -o tsv)
+          echo "::add-mask::$ACR_PASSWORD"
+          echo "ACR_USERNAME=$ACR_USERNAME" >> $GITHUB_OUTPUT
+          echo "ACR_PASSWORD=$ACR_PASSWORD" >> $GITHUB_OUTPUT
 
       - name: Deploy to Azure Container Apps
         run: |
@@ -68,6 +80,8 @@ jobs:
               --target-port 8500 \
               --ingress external \
               --registry-server ${{ env.ACR_NAME }}.azurecr.io \
+              --registry-username ${{ steps.acr-creds.outputs.ACR_USERNAME }} \
+              --registry-password ${{ steps.acr-creds.outputs.ACR_PASSWORD }} \
               --cpu 0.5 \
               --memory 1.0Gi \
               --min-replicas 1 \
