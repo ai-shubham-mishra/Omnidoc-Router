@@ -1,0 +1,97 @@
+name: Deploy Router to Azure Container Apps (Production)
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+env:
+  AZURE_RESOURCE_GROUP: omnidoc_developers
+  AZURE_LOCATION: switzerlandnorth
+  ACR_NAME: omnidoc
+  CONTAINER_APP_NAME: router-prod
+  CONTAINER_APP_ENV: omnidoc-prod-env
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      - name: Ensure Container Apps Environment exists
+        run: |
+          if ! az containerapp env show --name ${{ env.CONTAINER_APP_ENV }} --resource-group ${{ env.AZURE_RESOURCE_GROUP }} &> /dev/null; then
+            echo "Container Apps Environment does not exist. Creating..."
+            az containerapp env create \
+              --name ${{ env.CONTAINER_APP_ENV }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --location ${{ env.AZURE_LOCATION }}
+          else
+            echo "Container Apps Environment already exists."
+          fi
+
+      - name: Build and push to Azure Container Registry
+        run: |
+          az acr build \
+            --registry ${{ env.ACR_NAME }} \
+            --image omnidoc-router:latest \
+            --image omnidoc-router:${{ github.sha }} \
+            --file ./Dockerfile \
+            .
+
+      - name: Deploy to Azure Container Apps
+        run: |
+          # Check if container app exists
+          if az containerapp show --name ${{ env.CONTAINER_APP_NAME }} --resource-group ${{ env.AZURE_RESOURCE_GROUP }} &> /dev/null; then
+            echo "Container app exists. Updating..."
+            az containerapp update \
+              --name ${{ env.CONTAINER_APP_NAME }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --image ${{ env.ACR_NAME }}.azurecr.io/omnidoc-router:latest \
+              --set-env-vars "AGENTICAPI_BASE_URL=${{ secrets.AGENTICAPI_BASE_URL }}"
+          else
+            echo "Container app does not exist. Creating..."
+            az containerapp create \
+              --name ${{ env.CONTAINER_APP_NAME }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --environment ${{ env.CONTAINER_APP_ENV }} \
+              --image ${{ env.ACR_NAME }}.azurecr.io/omnidoc-router:latest \
+              --target-port 8500 \
+              --ingress external \
+              --registry-server ${{ env.ACR_NAME }}.azurecr.io \
+              --cpu 0.5 \
+              --memory 1.0Gi \
+              --min-replicas 1 \
+              --max-replicas 3 \
+              --env-vars \
+                "MONGO_DB_URL=${{ secrets.MONGO_DB_URL }}" \
+                "MONGO_DB_NAME=${{ secrets.MONGO_DB_NAME }}" \
+                "REDIS_URL=" \
+                "SESSION_TTL_SECONDS=259200" \
+                "REGISTERED_WORKFLOW_COLLECTION_NAME=${{ secrets.REGISTERED_WORKFLOW_COLLECTION_NAME }}" \
+                "GOOGLE_API_KEY=${{ secrets.GOOGLE_API_KEY }}" \
+                "JWT_SECRET=${{ secrets.JWT_SECRET }}" \
+                "AGENTICAPI_BASE_URL=${{ secrets.AGENTICAPI_BASE_URL }}"
+          fi
+
+      - name: Get Container App URL
+        run: |
+          APP_URL=$(az containerapp show \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv)
+          echo "🚀 Router deployment successful!"
+          echo "📍 Router URL: https://$APP_URL"
