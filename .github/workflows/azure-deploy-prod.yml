@@ -65,6 +65,13 @@ jobs:
           # Check if container app exists
           if az containerapp show --name ${{ env.CONTAINER_APP_NAME }} --resource-group ${{ env.AZURE_RESOURCE_GROUP }} &> /dev/null; then
             echo "Container app exists. Updating..."
+            az containerapp registry set \
+              --name ${{ env.CONTAINER_APP_NAME }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --server ${{ env.ACR_NAME }}.azurecr.io \
+              --username ${{ steps.acr-creds.outputs.ACR_USERNAME }} \
+              --password ${{ steps.acr-creds.outputs.ACR_PASSWORD }}
+            
             az containerapp update \
               --name ${{ env.CONTAINER_APP_NAME }} \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
