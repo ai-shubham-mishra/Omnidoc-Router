@@ -129,10 +129,10 @@ jobs:
               --name ${{ env.CONTAINER_APP_NAME }} \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
               --environment ${{ env.CONTAINER_APP_ENV }} \
-              --image ${{ env.ACR_NAME }}.azurecr.io/omnidoc-router:latest \
+              --image ${{ steps.acr-creds.outputs.ACR_LOGIN_SERVER }}/omnidoc-router:latest \
               --target-port 8500 \
               --ingress external \
-              --registry-server ${{ env.ACR_NAME }}.azurecr.io \
+              --registry-server ${{ steps.acr-creds.outputs.ACR_LOGIN_SERVER }} \
               --registry-username ${{ steps.acr-creds.outputs.ACR_USERNAME }} \
               --registry-password ${{ steps.acr-creds.outputs.ACR_PASSWORD }} \
               --cpu 0.5 \
