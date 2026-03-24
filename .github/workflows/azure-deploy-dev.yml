@@ -62,21 +62,55 @@ jobs:
 
       - name: Deploy to Azure Container Apps
         run: |
-          # Check if container app exists
+          # Check if container app exists and its state
           if az containerapp show --name ${{ env.CONTAINER_APP_NAME }} --resource-group ${{ env.AZURE_RESOURCE_GROUP }} &> /dev/null; then
-            echo "Container app exists. Updating..."
-            az containerapp registry set \
-              --name ${{ env.CONTAINER_APP_NAME }} \
-              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-              --server ${{ env.ACR_NAME }}.azurecr.io \
-              --username ${{ steps.acr-creds.outputs.ACR_USERNAME }} \
-              --password ${{ steps.acr-creds.outputs.ACR_PASSWORD }}
+            PROVISIONING_STATE=$(az containerapp show --name ${{ env.CONTAINER_APP_NAME }} --resource-group ${{ env.AZURE_RESOURCE_GROUP }} --query properties.provisioningState -o tsv)
+            echo "Container app exists with state: $PROVISIONING_STATE"
             
-            az containerapp update \
-              --name ${{ env.CONTAINER_APP_NAME }} \
-              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-              --image ${{ env.ACR_NAME }}.azurecr.io/omnidoc-router:dev \
-              --set-env-vars "AGENTICAPI_BASE_URL=${{ secrets.AGENTICAPI_BASE_URL }}"
+            if [ "$PROVISIONING_STATE" == "Failed" ]; then
+              echo "Container app is in Failed state. Deleting..."
+              az containerapp delete --name ${{ env.CONTAINER_APP_NAME }} --resource-group ${{ env.AZURE_RESOURCE_GROUP }} --yes
+              echo "Deleted failed container app. Will create new one."
+              
+              # Create new container app
+              az containerapp create \
+                --name ${{ env.CONTAINER_APP_NAME }} \
+                --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+                --environment ${{ env.CONTAINER_APP_ENV }} \
+                --image ${{ env.ACR_NAME }}.azurecr.io/omnidoc-router:dev \
+                --target-port 8500 \
+                --ingress external \
+                --registry-server ${{ env.ACR_NAME }}.azurecr.io \
+                --registry-username ${{ steps.acr-creds.outputs.ACR_USERNAME }} \
+                --registry-password ${{ steps.acr-creds.outputs.ACR_PASSWORD }} \
+                --cpu 0.25 \
+                --memory 0.5Gi \
+                --min-replicas 1 \
+                --max-replicas 2 \
+                --env-vars \
+                  "MONGO_DB_URL=${{ secrets.MONGO_DB_URL }}" \
+                  "MONGO_DB_NAME=${{ secrets.MONGO_DB_NAME }}" \
+                  "REDIS_URL=" \
+                  "SESSION_TTL_SECONDS=259200" \
+                  "REGISTERED_WORKFLOW_COLLECTION_NAME=${{ secrets.REGISTERED_WORKFLOW_COLLECTION_NAME }}" \
+                  "GOOGLE_API_KEY=${{ secrets.GOOGLE_API_KEY }}" \
+                  "JWT_SECRET=${{ secrets.JWT_SECRET }}" \
+                  "AGENTICAPI_BASE_URL=${{ secrets.AGENTICAPI_BASE_URL }}"
+            else
+              echo "Container app is healthy. Updating..."
+              az containerapp registry set \
+                --name ${{ env.CONTAINER_APP_NAME }} \
+                --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+                --server ${{ env.ACR_NAME }}.azurecr.io \
+                --username ${{ steps.acr-creds.outputs.ACR_USERNAME }} \
+                --password ${{ steps.acr-creds.outputs.ACR_PASSWORD }}
+              
+              az containerapp update \
+                --name ${{ env.CONTAINER_APP_NAME }} \
+                --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+                --image ${{ env.ACR_NAME }}.azurecr.io/omnidoc-router:dev \
+                --set-env-vars "AGENTICAPI_BASE_URL=${{ secrets.AGENTICAPI_BASE_URL }}"
+            fi
           else
             echo "Container app does not exist. Creating..."
             az containerapp create \
