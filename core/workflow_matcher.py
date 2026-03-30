@@ -13,18 +13,19 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-MONGO_DB_URL = os.getenv("MONGO_DB_URL")
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME")
-REGISTERED_WORKFLOW_COLLECTION_NAME = os.getenv("REGISTERED_WORKFLOW_COLLECTION_NAME")
+from utils.db_config import (
+    AZ_COSMOS_DB_URL, AZ_COSMOS_DB_NAME,
+    REGISTERED_WORKFLOWS_COLLECTION,
+)
 
 
 class WorkflowMatcher:
-    """Match user messages to workflows using the existing MongoDB registry."""
+    """Match user messages to workflows using the existing workflow registry."""
 
     def __init__(self):
-        self.client = MongoClient(MONGO_DB_URL)
-        self.db = self.client[MONGO_DB_NAME]
-        self.collection = self.db[REGISTERED_WORKFLOW_COLLECTION_NAME]
+        self.client = MongoClient(AZ_COSMOS_DB_URL)
+        self.db = self.client[AZ_COSMOS_DB_NAME]
+        self.collection = self.db[REGISTERED_WORKFLOWS_COLLECTION]
 
     def get_all_workflows(self, org_id: str) -> List[Dict[str, Any]]:
         """Get all workflows accessible to user's organization."""

@@ -92,7 +92,9 @@ class RouterOrchestrator:
         # 2. Handle file uploads (add to context with classification)
         files_uploaded = []
         if files:
-            stored_files = await self.files.save_files_to_session(session_id, files)
+            stored_files = await self.files.save_files_to_session(
+                session_id, files, user_id=user_id, org_id=org_id
+            )
             
             # Classify each file for intelligent matching
             current_wf = session.get("current_workflow", {})

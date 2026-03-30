@@ -17,17 +17,18 @@ from utils.config import SESSION_TTL_SECONDS
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-MONGO_DB_URL = os.getenv("MONGO_DB_URL")
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME")
-CHAT_SESSIONS_COLLECTION = "chat_sessions"
+from utils.db_config import (
+    AZ_COSMOS_DB_URL, AZ_COSMOS_DB_NAME,
+    CHAT_SESSIONS_COLLECTION,
+)
 
 
 class SessionManager:
-    """Manages chat session state with Redis caching and MongoDB persistence."""
+    """Manages chat session state with Redis caching and Cosmos DB persistence."""
 
     def __init__(self):
-        self.client = MongoClient(MONGO_DB_URL)
-        self.db = self.client[MONGO_DB_NAME]
+        self.client = MongoClient(AZ_COSMOS_DB_URL)
+        self.db = self.client[AZ_COSMOS_DB_NAME]
         self.collection = self.db[CHAT_SESSIONS_COLLECTION]
         self.redis = redis_client
         self._ensure_indexes()

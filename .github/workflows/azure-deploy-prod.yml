@@ -72,6 +72,29 @@ jobs:
           
           echo "ACR Login Server: $ACR_LOGIN_SERVER"
 
+      - name: Sync Secrets to Azure Container App
+        run: |
+          echo "Syncing secrets from GitHub to Azure Container App..."
+          
+          # Check if container app exists to determine if we can set secrets
+          if az containerapp show --name ${{ env.CONTAINER_APP_NAME }} --resource-group ${{ env.AZURE_RESOURCE_GROUP }} &> /dev/null; then
+            echo "Container app exists. Updating secrets..."
+            az containerapp secret set \
+              --name ${{ env.CONTAINER_APP_NAME }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --secrets \
+                "mongo-db-url=${{ secrets.MONGO_DB_URL }}" \
+                "mongo-db-name=${{ secrets.MONGO_DB_NAME }}" \
+                "registered-workflow-collection-name=${{ secrets.REGISTERED_WORKFLOW_COLLECTION_NAME }}" \
+                "google-api-key=${{ secrets.GOOGLE_API_KEY }}" \
+                "jwt-secret=${{ secrets.JWT_SECRET }}" \
+                "agenticapi-base-url=${{ secrets.AGENTICAPI_BASE_URL }}"
+            
+            echo "✅ Secrets synced successfully from GitHub to Azure"
+          else
+            echo "Container app does not exist yet. Secrets will be created during app creation."
+          fi
+
       - name: Deploy to Azure Container Apps
         run: |
           # Check if container app exists and its state
@@ -80,11 +103,11 @@ jobs:
             echo "Container app exists with state: $PROVISIONING_STATE"
             
             if [ "$PROVISIONING_STATE" == "Failed" ]; then
-              echo "Container app is in Failed state. Deleting..."
+              echo "Container app is in Failed state. Deleting and recreating..."
               az containerapp delete --name ${{ env.CONTAINER_APP_NAME }} --resource-group ${{ env.AZURE_RESOURCE_GROUP }} --yes
-              echo "Deleted failed container app. Will create new one."
+              echo "Deleted failed container app. Recreating..."
               
-              # Create new container app
+              # Create new container app (secrets already set above)
               az containerapp create \
                 --name ${{ env.CONTAINER_APP_NAME }} \
                 --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
@@ -100,16 +123,18 @@ jobs:
                 --min-replicas 1 \
                 --max-replicas 3 \
                 --env-vars \
-                  "MONGO_DB_URL=${{ secrets.MONGO_DB_URL }}" \
-                  "MONGO_DB_NAME=${{ secrets.MONGO_DB_NAME }}" \
+                  "MONGO_DB_URL=secretref:mongo-db-url" \
+                  "MONGO_DB_NAME=secretref:mongo-db-name" \
                   "REDIS_URL=" \
                   "SESSION_TTL_SECONDS=259200" \
-                  "REGISTERED_WORKFLOW_COLLECTION_NAME=${{ secrets.REGISTERED_WORKFLOW_COLLECTION_NAME }}" \
-                  "GOOGLE_API_KEY=${{ secrets.GOOGLE_API_KEY }}" \
-                  "JWT_SECRET=${{ secrets.JWT_SECRET }}" \
-                  "AGENTICAPI_BASE_URL=${{ secrets.AGENTICAPI_BASE_URL }}"
+                  "REGISTERED_WORKFLOW_COLLECTION_NAME=secretref:registered-workflow-collection-name" \
+                  "GOOGLE_API_KEY=secretref:google-api-key" \
+                  "JWT_SECRET=secretref:jwt-secret" \
+                  "AGENTICAPI_BASE_URL=secretref:agenticapi-base-url"
+              
+              echo "✅ Container app recreated successfully"
             else
-              echo "Container app is healthy. Updating..."
+              echo "Container app is healthy. Updating image..."
               az containerapp registry set \
                 --name ${{ env.CONTAINER_APP_NAME }} \
                 --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
@@ -120,11 +145,14 @@ jobs:
               az containerapp update \
                 --name ${{ env.CONTAINER_APP_NAME }} \
                 --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-                --image ${{ steps.acr-creds.outputs.ACR_LOGIN_SERVER }}/omnidoc-router:latest \
-                --set-env-vars "AGENTICAPI_BASE_URL=${{ secrets.AGENTICAPI_BASE_URL }}"
+                --image ${{ steps.acr-creds.outputs.ACR_LOGIN_SERVER }}/omnidoc-router:latest
+              
+              echo "✅ Image and secrets updated successfully"
             fi
           else
-            echo "Container app does not exist. Creating..."
+            echo "Container app does not exist. Creating new one..."
+            
+            # Create container app with initial secrets from GitHub
             az containerapp create \
               --name ${{ env.CONTAINER_APP_NAME }} \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
@@ -139,15 +167,24 @@ jobs:
               --memory 1.0Gi \
               --min-replicas 1 \
               --max-replicas 3 \
+              --secrets \
+                "mongo-db-url=${{ secrets.MONGO_DB_URL }}" \
+                "mongo-db-name=${{ secrets.MONGO_DB_NAME }}" \
+                "registered-workflow-collection-name=${{ secrets.REGISTERED_WORKFLOW_COLLECTION_NAME }}" \
+                "google-api-key=${{ secrets.GOOGLE_API_KEY }}" \
+                "jwt-secret=${{ secrets.JWT_SECRET }}" \
+                "agenticapi-base-url=${{ secrets.AGENTICAPI_BASE_URL }}" \
               --env-vars \
-                "MONGO_DB_URL=${{ secrets.MONGO_DB_URL }}" \
-                "MONGO_DB_NAME=${{ secrets.MONGO_DB_NAME }}" \
+                "MONGO_DB_URL=secretref:mongo-db-url" \
+                "MONGO_DB_NAME=secretref:mongo-db-name" \
                 "REDIS_URL=" \
                 "SESSION_TTL_SECONDS=259200" \
-                "REGISTERED_WORKFLOW_COLLECTION_NAME=${{ secrets.REGISTERED_WORKFLOW_COLLECTION_NAME }}" \
-                "GOOGLE_API_KEY=${{ secrets.GOOGLE_API_KEY }}" \
-                "JWT_SECRET=${{ secrets.JWT_SECRET }}" \
-                "AGENTICAPI_BASE_URL=${{ secrets.AGENTICAPI_BASE_URL }}"
+                "REGISTERED_WORKFLOW_COLLECTION_NAME=secretref:registered-workflow-collection-name" \
+                "GOOGLE_API_KEY=secretref:google-api-key" \
+                "JWT_SECRET=secretref:jwt-secret" \
+                "AGENTICAPI_BASE_URL=secretref:agenticapi-base-url"
+            
+            echo "✅ Container app created successfully with all secrets"
           fi
 
       - name: Get Container App URL
