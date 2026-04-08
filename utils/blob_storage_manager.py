@@ -22,6 +22,7 @@ from azure.storage.blob import (
 )
 from azure.core.exceptions import ResourceNotFoundError, AzureError
 from dotenv import load_dotenv
+from components.KeyVaultClient import get_secret
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -40,15 +41,16 @@ class BlobStorageManager:
     """Manages file storage in Azure Blob Storage with hierarchical org/user/session/run paths."""
 
     def __init__(self):
-        """Initialize Azure Blob Storage client using connection string from env."""
-        self.connection_string = os.getenv("AZ_BLOB_CONN_STRING")
-        self.container_name = os.getenv("AZ_BLOB_CONTAINER_NAME", "knowledge-base")
-        self.account_name = os.getenv("AZ_BLOB_STORAGE_ACCOUNT_NAME", "omnidocdev")
-        self.account_key = os.getenv("AZ_BLOB_CONN_KEY")
-        self.base_directory = os.getenv("AZ_BLOB_BASE_DIRECTORY", "knowledge-base")
+        """Initialize Azure Blob Storage client using connection string from Key Vault."""
+        # Fetch secrets from Key Vault (fallback to env for local dev without vault)
+        self.connection_string = get_secret("AZ_BLOB_CONN_STRING", default=os.getenv("AZ_BLOB_CONN_STRING"))
+        self.container_name = get_secret("AZ_BLOB_CONTAINER_NAME", default=os.getenv("AZ_BLOB_CONTAINER_NAME", "knowledge-base"))
+        self.account_name = get_secret("AZ_BLOB_STORAGE_ACCOUNT_NAME", default=os.getenv("AZ_BLOB_STORAGE_ACCOUNT_NAME", "omnidocdev"))
+        self.account_key = get_secret("AZ_BLOB_CONN_KEY", default=os.getenv("AZ_BLOB_CONN_KEY"))
+        self.base_directory = os.getenv("AZ_BLOB_BASE_DIRECTORY", "knowledge_base")
 
         if not self.connection_string:
-            raise ValueError("AZ_BLOB_CONN_STRING not found in environment variables")
+            raise ValueError("AZ_BLOB_CONN_STRING not found in Key Vault or environment variables")
 
         try:
             self.blob_service_client = BlobServiceClient.from_connection_string(self.connection_string)
@@ -74,23 +76,35 @@ class BlobStorageManager:
         original_filename: str,
     ) -> str:
         """
-        Build hierarchical blob path:
-        knowledge-base/<orgId>/<userId>/<sessionId>/<runId>/<stage>/<fileId>_<name>.<ext>
+        Build hierarchical blob path.
+        With run_id:    base/<orgId>/<userId>/<sessionId>/<runId>/<stage>/<file>
+        Without run_id: base/<orgId>/<userId>/<sessionId>/uploads/<file>
         """
         _, ext = os.path.splitext(original_filename)
         if not ext:
             ext = ".bin"
         safe_name = _sanitize(os.path.splitext(original_filename)[0])
         filename = f"{file_id}_{safe_name}{ext}"
-        return "/".join([
-            self.base_directory,
-            org_id or "unknown_org",
-            user_id or "unknown_user",
-            session_id or "no_session",
-            run_id or "no_run",
-            stage,
-            filename,
-        ])
+
+        if run_id:
+            return "/".join([
+                self.base_directory,
+                org_id or "unknown_org",
+                user_id or "unknown_user",
+                session_id or "no_session",
+                run_id,
+                stage,
+                filename,
+            ])
+        else:
+            return "/".join([
+                self.base_directory,
+                org_id or "unknown_org",
+                user_id or "unknown_user",
+                session_id or "no_session",
+                "uploads",
+                filename,
+            ])
 
     def _run_prefix(self, org_id: str, user_id: str, session_id: str, run_id: str) -> str:
         """Prefix for all files belonging to a run."""

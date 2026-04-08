@@ -46,6 +46,9 @@ class RequestBuilder:
             api_field = inp.get("endpoint_field_name", router_field)  # Default to field if not specified
             field_mapping[router_field] = api_field
 
+        # Build set of file-type fields from schema
+        file_type_fields = {inp["field"] for inp in required_inputs if inp.get("type") == "file"}
+
         headers = {"Authorization": jwt_token}
 
         file_fields = {}
@@ -63,12 +66,10 @@ class RequestBuilder:
             # Get the API parameter name for this field
             api_field = field_mapping.get(router_field, router_field)
 
-            # Detect file inputs (list of file paths)
-            if isinstance(value, list) and value and isinstance(value[0], str) and ("tmp/" in value[0] or "tmp\\" in value[0]):
-                # File input: store under router field, but mark endpoint_name for multipart
+            # File input: detect by schema type
+            if router_field in file_type_fields and isinstance(value, list):
                 file_fields[router_field] = {"paths": value, "endpoint_name": api_field}
             else:
-                # Non-file input: use API parameter name directly
                 data_fields[api_field] = value
 
         if "runId" not in data_fields and "runid" not in data_fields:

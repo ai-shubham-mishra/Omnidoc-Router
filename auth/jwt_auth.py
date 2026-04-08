@@ -3,6 +3,7 @@ import os
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+from components.KeyVaultClient import get_secret
 
 load_dotenv()
 
@@ -23,10 +24,10 @@ class TokenInvalidError(JWTError):
 
 
 def get_jwt_secret() -> str:
-    """Get JWT secret from environment variables"""
-    secret = os.getenv('JWT_SECRET')
+    """Get JWT secret from Key Vault (with .env fallback)"""
+    secret = get_secret('JWT_SECRET', default=os.getenv('JWT_SECRET'))
     if not secret:
-        raise ValueError('JWT_SECRET is not defined in environment variables')
+        raise ValueError('JWT_SECRET is not defined in Key Vault or environment variables')
     return secret
 
 

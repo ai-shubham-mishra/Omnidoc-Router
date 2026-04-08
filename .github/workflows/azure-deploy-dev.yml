@@ -72,29 +72,6 @@ jobs:
           
           echo "ACR Login Server: $ACR_LOGIN_SERVER"
 
-      - name: Sync Secrets to Azure Container App
-        run: |
-          echo "Syncing secrets from GitHub to Azure Container App..."
-          
-          # Check if container app exists to determine if we can set secrets
-          if az containerapp show --name ${{ env.CONTAINER_APP_NAME }} --resource-group ${{ env.AZURE_RESOURCE_GROUP }} &> /dev/null; then
-            echo "Container app exists. Updating secrets..."
-            az containerapp secret set \
-              --name ${{ env.CONTAINER_APP_NAME }} \
-              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-              --secrets \
-                "mongo-db-url=${{ secrets.MONGO_DB_URL }}" \
-                "mongo-db-name=${{ secrets.MONGO_DB_NAME }}" \
-                "registered-workflow-collection-name=${{ secrets.REGISTERED_WORKFLOW_COLLECTION_NAME }}" \
-                "google-api-key=${{ secrets.GOOGLE_API_KEY }}" \
-                "jwt-secret=${{ secrets.JWT_SECRET }}" \
-                "agenticapi-base-url=${{ secrets.AGENTICAPI_BASE_URL }}"
-            
-            echo "✅ Secrets synced successfully from GitHub to Azure"
-          else
-            echo "Container app does not exist yet. Secrets will be created during app creation."
-          fi
-
       - name: Deploy to Azure Container Apps
         run: |
           # Check if container app exists and its state
@@ -107,7 +84,7 @@ jobs:
               az containerapp delete --name ${{ env.CONTAINER_APP_NAME }} --resource-group ${{ env.AZURE_RESOURCE_GROUP }} --yes
               echo "Deleted failed container app. Recreating..."
               
-              # Create new container app (secrets already set above)
+              # Create new container app using Azure Key Vault for secrets
               az containerapp create \
                 --name ${{ env.CONTAINER_APP_NAME }} \
                 --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
@@ -123,14 +100,16 @@ jobs:
                 --min-replicas 1 \
                 --max-replicas 2 \
                 --env-vars \
-                  "MONGO_DB_URL=secretref:mongo-db-url" \
-                  "MONGO_DB_NAME=secretref:mongo-db-name" \
-                  "REDIS_URL=" \
+                  "AZURE_KEY_VAULT_URL=https://omnidoc-vault.vault.azure.net/" \
+                  "PINECONE_INDEX_NAME=llama-text-embed-v2-index" \
+                  "AZ_COSMOS_DB_NAME=omnidoc-backend-dev" \
+                  "AZ_COSMOS_DB_REGISTERED_WORKFLOWS_COLLECTION=registeredWorkflows" \
+                  "AZ_COSMOS_DB_CHAT_SESSIONS_COLLECTION=chat_sessions" \
                   "SESSION_TTL_SECONDS=259200" \
-                  "REGISTERED_WORKFLOW_COLLECTION_NAME=secretref:registered-workflow-collection-name" \
-                  "GOOGLE_API_KEY=secretref:google-api-key" \
-                  "JWT_SECRET=secretref:jwt-secret" \
-                  "AGENTICAPI_BASE_URL=secretref:agenticapi-base-url"
+                  "STORAGE_BACKEND=azure" \
+                  "AZ_BLOB_BASE_DIRECTORY=knowledge_base" \
+                  "AZ_BLOB_CONTAINER_NAME=knowledge-base" \
+                  "AZ_BLOB_STORAGE_ACCOUNT_NAME=omnidocdev"
               
               echo "✅ Container app recreated successfully"
             else
@@ -152,7 +131,7 @@ jobs:
           else
             echo "Container app does not exist. Creating new one..."
             
-            # Create container app with initial secrets from GitHub
+            # Create container app using Azure Key Vault for secrets
             az containerapp create \
               --name ${{ env.CONTAINER_APP_NAME }} \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
@@ -167,24 +146,19 @@ jobs:
               --memory 0.5Gi \
               --min-replicas 1 \
               --max-replicas 2 \
-              --secrets \
-                "mongo-db-url=${{ secrets.MONGO_DB_URL }}" \
-                "mongo-db-name=${{ secrets.MONGO_DB_NAME }}" \
-                "registered-workflow-collection-name=${{ secrets.REGISTERED_WORKFLOW_COLLECTION_NAME }}" \
-                "google-api-key=${{ secrets.GOOGLE_API_KEY }}" \
-                "jwt-secret=${{ secrets.JWT_SECRET }}" \
-                "agenticapi-base-url=${{ secrets.AGENTICAPI_BASE_URL }}" \
               --env-vars \
-                "MONGO_DB_URL=secretref:mongo-db-url" \
-                "MONGO_DB_NAME=secretref:mongo-db-name" \
-                "REDIS_URL=" \
+                "AZURE_KEY_VAULT_URL=https://omnidoc-vault.vault.azure.net/" \
+                "PINECONE_INDEX_NAME=llama-text-embed-v2-index" \
+                "AZ_COSMOS_DB_NAME=omnidoc-backend-dev" \
+                "AZ_COSMOS_DB_REGISTERED_WORKFLOWS_COLLECTION=registeredWorkflows" \
+                "AZ_COSMOS_DB_CHAT_SESSIONS_COLLECTION=chat_sessions" \
                 "SESSION_TTL_SECONDS=259200" \
-                "REGISTERED_WORKFLOW_COLLECTION_NAME=secretref:registered-workflow-collection-name" \
-                "GOOGLE_API_KEY=secretref:google-api-key" \
-                "JWT_SECRET=secretref:jwt-secret" \
-                "AGENTICAPI_BASE_URL=secretref:agenticapi-base-url"
+                "STORAGE_BACKEND=azure" \
+                "AZ_BLOB_BASE_DIRECTORY=knowledge_base" \
+                "AZ_BLOB_CONTAINER_NAME=knowledge-base" \
+                "AZ_BLOB_STORAGE_ACCOUNT_NAME=omnidocdev"
             
-            echo "✅ Container app created successfully with all secrets"
+            echo "✅ Container app created successfully using Key Vault for secrets"
           fi
 
       - name: Get Container App URL

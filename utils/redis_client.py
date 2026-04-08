@@ -1,4 +1,4 @@
-"""
+"""  
 Redis client for session caching.
 Provides write-through cache with automatic TTL refresh.
 """
@@ -9,11 +9,12 @@ import logging
 from typing import Optional, Dict, Any
 from redis import asyncio as aioredis
 from dotenv import load_dotenv
+from components.KeyVaultClient import get_secret
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+REDIS_URL = get_secret("REDIS_URL", default=os.getenv("REDIS_URL", "redis://localhost:6379"))
 SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", "259200"))  # 3 days
 
 

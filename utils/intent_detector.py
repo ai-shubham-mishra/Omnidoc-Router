@@ -203,12 +203,3 @@ class IntentDetector:
         
         # Only auto-execute if user explicitly wants to proceed
         return intent == "execute"
-    
-    @classmethod
-    def generate_confirmation_prompt(cls, workflow_name: str, inputs_summary: str) -> str:
-        """Generate a confirmation prompt when all inputs are ready."""
-        return (
-            f"All required inputs collected for {workflow_name}!\n\n"
-            f"{inputs_summary}\n\n"
-            f"Ready to proceed? Reply 'yes' to execute, or provide additional information."
-        )

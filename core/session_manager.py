@@ -2,6 +2,10 @@
 Session manager for the LLM Router.
 Handles chat session CRUD operations with Redis write-through cache.
 Sessions stored in MongoDB (persistent) and Redis (fast access, 3-day TTL).
+
+Pinecone Integration:
+- Embeds chat messages for semantic search and long-term context
+- Enables retrieval of relevant conversation history beyond Redis TTL
 """
 import os
 import logging
@@ -13,6 +17,7 @@ from dotenv import load_dotenv
 
 from utils.redis_client import redis_client
 from utils.config import SESSION_TTL_SECONDS
+from components.PineconeClient import pinecone_client
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -135,6 +140,24 @@ class SessionManager:
         updated_session = self.collection.find_one({"_id": session_id})
         if updated_session:
             await self.redis.set_session(session_id, updated_session)
+        
+        # Embed message in Pinecone for semantic search
+        if session:
+            user_id = session.get("user_id", "")
+            org_id = session.get("org_id", "")
+            current_wf = session.get("current_workflow", {})
+            run_id = current_wf.get("run_id")
+            workflow_name = current_wf.get("workflow_name")
+            
+            pinecone_client.embed_and_upsert_message(
+                session_id=session_id,
+                message=content,
+                role=role,
+                user_id=user_id,
+                org_id=org_id,
+                run_id=run_id,
+                workflow_name=workflow_name,
+            )
 
     async def set_workflow_context(
         self,

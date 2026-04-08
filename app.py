@@ -29,6 +29,9 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+# Suppress verbose Azure SDK HTTP logs
+logging.getLogger("azure").setLevel(logging.WARNING)
+logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
 
 app = FastAPI(
     title="Omnidoc Router",
@@ -89,15 +92,30 @@ async def router_message(
     - Upload files to session context
     - Or both simultaneously
     
-    This is the recommended endpoint (replaces /chat and /upload).
+    Session ID Priority:
+    1. X-Session-Id header (required - frontend always provides)
+    2. Form data session_id (fallback)
+    
+    Returns error if no session_id provided.
     """
     user_id = user_context.user_id
     org_id = user_context.raw_payload.get("organizationId", "")
     jwt_token = request.headers.get("Authorization", "")
+    
+    # Get session ID from header (primary) or form data (fallback)
+    final_session_id = request.headers.get("X-Session-Id") or session_id
+    
+    # Session ID is required - frontend must provide it
+    if not final_session_id:
+        return RouterResponse(
+            status="failed",
+            response="Session ID is required. Provide X-Session-Id header.",
+            error=ErrorDetail(code="MISSING_SESSION_ID", message="X-Session-Id header is required"),
+        )
 
     result = await router_orchestrator.handle_message(
         message=message,
-        session_id=session_id,
+        session_id=final_session_id,
         files=files if files else [],
         user_id=user_id,
         org_id=org_id,
@@ -112,14 +130,25 @@ async def router_chat(
     request: Request,
     user_context: UserContext = Depends(get_current_user),
 ):
-    """Chat with the LLM Router. Handles intent detection, input collection, and workflow execution."""
+    """Chat with the LLM Router. Session ID required via X-Session-Id header or body."""
     user_id = user_context.user_id
     org_id = user_context.raw_payload.get("organizationId", "")
     jwt_token = request.headers.get("Authorization", "")
+    
+    # Get session ID from header (primary) or body (fallback)
+    final_session_id = request.headers.get("X-Session-Id") or body.session_id
+    
+    # Session ID is required
+    if not final_session_id:
+        return RouterResponse(
+            status="failed",
+            response="Session ID is required. Provide X-Session-Id header.",
+            error=ErrorDetail(code="MISSING_SESSION_ID", message="X-Session-Id header or body.session_id is required"),
+        )
 
     result = await router_orchestrator.handle_chat(
         message=body.message,
-        session_id=body.session_id,
+        session_id=final_session_id,
         user_id=user_id,
         org_id=org_id,
         jwt_token=jwt_token,
@@ -141,24 +170,27 @@ async def router_upload(
     session_id = form.get("session_id")
     field_name = form.get("field_name", "files")
     files = form.getlist("files")
+    
+    # Prioritize X-Session-Id header over form data
+    final_session_id = request.headers.get("X-Session-Id") or session_id
 
-    if not session_id:
+    if not final_session_id:
         return RouterResponse(
             status="failed",
             response="session_id is required for file uploads.",
-            error=ErrorDetail(code="MISSING_SESSION", message="Provide session_id in form data"),
+            error=ErrorDetail(code="MISSING_SESSION", message="Provide session_id in X-Session-Id header or form data"),
         )
 
     if not files:
         return RouterResponse(
-            session_id=session_id,
+            session_id=final_session_id,
             status="failed",
             response="No files provided.",
             error=ErrorDetail(code="NO_FILES", message="Upload at least one file"),
         )
 
     result = await router_orchestrator.handle_file_upload(
-        session_id=session_id,
+        session_id=final_session_id,
         files=files,
         field_name=field_name,
         user_id=user_id,
@@ -174,13 +206,24 @@ async def router_confirm(
     request: Request,
     user_context: UserContext = Depends(get_current_user),
 ):
-    """Confirm or cancel a HITL step."""
+    """Confirm or cancel a HITL step. Session ID required."""
     user_id = user_context.user_id
     org_id = user_context.raw_payload.get("organizationId", "")
     jwt_token = request.headers.get("Authorization", "")
+    
+    # Get session ID from header (primary) or body (fallback)
+    final_session_id = request.headers.get("X-Session-Id") or body.session_id
+    
+    # Session ID is required
+    if not final_session_id:
+        return RouterResponse(
+            status="failed",
+            response="Session ID is required. Provide X-Session-Id header.",
+            error=ErrorDetail(code="MISSING_SESSION_ID", message="X-Session-Id header or body.session_id is required"),
+        )
 
     result = await router_orchestrator.handle_confirmation(
-        session_id=body.session_id,
+        session_id=final_session_id,
         action=body.action,
         user_id=user_id,
         org_id=org_id,

@@ -27,3 +27,17 @@ PyJWT
 
 # Azure Blob Storage
 azure-storage-blob>=12.19.0
+
+# Azure Key Vault (for secrets)
+azure-identity
+azure-keyvault-secrets
+
+# Pinecone Vector Database
+pinecone
+
+# Text splitting for embeddings
+tiktoken
+
+# Text extraction from files
+PyPDF2
+python-docx

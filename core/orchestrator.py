@@ -3,6 +3,11 @@ Main Orchestrator for the LLM Router.
 Connects all router components: session management, workflow matching,
 input collection, request building, file handling, and Gemini LLM.
 Makes internal HTTP calls to the AgenticAPI workflow endpoints.
+
+Pinecone Integration:
+- Retrieves semantic context from chat history and file content
+- Enhances workflow matching and input collection with long-term memory
+- Enables RAG-style question answering using Pinecone vector search
 """
 import os
 import uuid
@@ -20,6 +25,8 @@ from handlers.input_collector import InputCollector
 from handlers.request_builder import RequestBuilder
 from handlers.file_handler import FileHandler
 from utils.intent_detector import IntentDetector
+from components.PineconeClient import pinecone_client
+from components.KeyVaultClient import get_secret
 from models.api_contracts import (
     RouterResponse,
     WorkflowIdentified,
@@ -33,7 +40,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # Base URL for calling workflow endpoints on the AgenticAPI service
-AGENTICAPI_BASE_URL = os.getenv("AGENTICAPI_BASE_URL", "http://localhost:8400")
+AGENTICAPI_BASE_URL = get_secret("AGENTICAPI_BASE_URL", default=os.getenv("AGENTICAPI_BASE_URL", "http://localhost:8400"))
 
 
 class RouterOrchestrator:
@@ -74,22 +81,27 @@ class RouterOrchestrator:
         - Explicit execution intent required
         - Multi-workflow support
         - Session persists across workflows
+        - Session ID must be provided by frontend (never auto-generated)
         """
-        #  1. Get or create session
-        if session_id:
-            session = await self.sessions.get_session(session_id)
-            if not session:
-                return RouterResponse(
-                    status="failed",
-                    response="Session not found. Please start a new conversation.",
-                    error=ErrorDetail(code="SESSION_NOT_FOUND", message="Invalid session_id"),
-                )
-            await self.sessions.update_jwt_token(session_id, jwt_token)
-        else:
-            session_id = str(uuid.uuid4())
+        # 1. Validate session_id is provided
+        if not session_id:
+            return RouterResponse(
+                status="failed",
+                response="Session ID is required. Frontend must provide X-Session-Id header.",
+                error=ErrorDetail(code="MISSING_SESSION_ID", message="session_id is required"),
+            )
+        
+        # 2. Get or create session with provided ID
+        session = await self.sessions.get_session(session_id)
+        if not session:
+            # Session doesn't exist - create new one with frontend-provided ID
             session = self.sessions.create_session(session_id, user_id, org_id, jwt_token)
+            logger.info(f"Created new session with frontend ID: {session_id[:8]}...")
+        else:
+            # Session exists - update JWT token
+            await self.sessions.update_jwt_token(session_id, jwt_token)
 
-        # 2. Handle file uploads (add to context with classification)
+        # 3. Handle file uploads (add to context with classification)
         files_uploaded = []
         if files:
             stored_files = await self.files.save_files_to_session(
@@ -129,36 +141,12 @@ class RouterOrchestrator:
         wf_status = current_wf.get("status", "idle")
 
         # 4b. Immediately match newly uploaded files to active workflow inputs
-        #     This runs BEFORE any intent routing so files are matched regardless
-        #     of whether the message is a question, delay, or collect.
-        if files_uploaded and current_wf.get("workflow_id") and wf_status in ("collecting", "ready_to_execute"):
-            required_inputs = current_wf.get("required_inputs", [])
-            session_files = session.get("uploaded_files", [])
-            workflow_name = current_wf.get("workflow_name", "")
-            matched_any = False
-
-            for inp in required_inputs:
-                if inp.get("type") == "file" and not inp.get("collected"):
-                    best_file = self.file_intel.find_best_file_for_input(
-                        session_files, inp, workflow_name
-                    )
-                    if best_file:
-                        file_path = best_file.get("stored_path")
-                        if file_path:
-                            await self.sessions.mark_input_collected(
-                                session_id, inp["field"], [file_path]
-                            )
-                            matched_any = True
-                            logger.info(
-                                f"✅ Immediate file match: '{best_file.get('original_name')}' "
-                                f"→ {inp.get('label', inp['field'])} for '{workflow_name}'"
-                            )
-
-            if matched_any:
-                # Refresh session after matching so all subsequent handlers see updated state
-                session = await self.sessions.get_session(session_id)
-                current_wf = session.get("current_workflow", {})
-                wf_status = current_wf.get("status", "idle")
+        #     Runs BEFORE any intent routing so files are matched regardless.
+        if current_wf.get("workflow_id") and wf_status in ("collecting", "ready_to_execute"):
+            await self._recheck_all_inputs(session_id, session)
+            session = await self.sessions.get_session(session_id)
+            current_wf = session.get("current_workflow", {})
+            wf_status = current_wf.get("status", "idle")
 
         # 5. State machine routing
         if wf_status == "awaiting_confirmation":
@@ -212,8 +200,12 @@ class RouterOrchestrator:
                         files_uploaded=files_uploaded if files_uploaded else None,
                     )
             
-            # No clear intent - return waiting message
-            response_text = "Waiting for your confirmation. Use the confirm/cancel buttons or send 'yes'/'cancel'."
+            # No clear intent - generate dynamic waiting prompt
+            wf_name = current_wf.get("workflow_name", "the workflow")
+            response_text = self.gemini.generate_contextual_response(
+                f"User sent a message during HITL confirmation for '{wf_name}'. Remind them to confirm or cancel.",
+                {"workflow_name": wf_name},
+            )
             await self.sessions.add_message(session_id, "assistant", response_text)
             return RouterResponse(
                 session_id=session_id,
@@ -224,7 +216,11 @@ class RouterOrchestrator:
             )
 
         if wf_status == "executing":
-            response_text = "Workflow is currently executing. Please wait..."
+            wf_name = current_wf.get("workflow_name", "the workflow")
+            response_text = self.gemini.generate_contextual_response(
+                f"'{wf_name}' is currently running. Ask the user to wait.",
+                {"workflow_name": wf_name},
+            )
             return RouterResponse(
                 session_id=session_id,
                 status="executing",
@@ -232,11 +228,22 @@ class RouterOrchestrator:
                 files_uploaded=files_uploaded if files_uploaded else None,
             )
 
-        # 5b. Handle conversational questions (RAG-style)
+        # 5b. Handle conversational questions (RAG-style with Pinecone)
         if message:
             msg_intent = self.intent.detect_execution_intent(message)
             if msg_intent == "question":
+                # Build traditional session context
                 session_context = self.file_intel.build_session_context(session)
+                
+                # Enhance with Pinecone semantic context
+                pinecone_context = self._get_pinecone_context(
+                    query=message,
+                    session_id=session_id,
+                    org_id=org_id,
+                    top_k=5,
+                )
+                session_context["pinecone_context"] = pinecone_context
+                
                 answer = self.file_intel.answer_session_question(message, session_context)
                 await self.sessions.add_message(session_id, "assistant", answer)
                 
@@ -283,7 +290,12 @@ class RouterOrchestrator:
             )
 
         # Fallback
-        response_text = "I'm not sure how to proceed. Please describe what you'd like to do."
+        session_files = session.get("uploaded_files", [])
+        file_names = [f.get("original_name", "") for f in session_files]
+        response_text = self.gemini.generate_contextual_response(
+            "User is idle with no active workflow. Ask what they'd like to do.",
+            {"files": file_names},
+        )
         await self.sessions.add_message(session_id, "assistant", response_text)
         return RouterResponse(
             session_id=session_id,
@@ -432,17 +444,60 @@ class RouterOrchestrator:
     ) -> RouterResponse:
         """
         Phase 1: Match user intent to a workflow (v2 with multi-workflow support).
+        Uses Pinecone context when available to enhance workflow matching.
         """
+        session = await self.sessions.get_session(session_id)
+        
         if not message:
-            # File uploaded without message
-            prompt = "Files uploaded! What would you like to do with them?"
-            await self.sessions.add_message(session_id, "assistant", prompt)
-            return RouterResponse(
-                session_id=session_id,
-                status="idle",
-                response=prompt,
-                files_uploaded=files_uploaded if files_uploaded else None,
-            )
+            # File uploaded without message - use file classification to infer intent
+            session_files = session.get("uploaded_files", [])
+            if files_uploaded and session_files:
+                # Build synthetic query from file classifications
+                latest_files = session_files[-len(files_uploaded):]
+                file_types = [f.get("classification", {}).get("document_type", "document") for f in latest_files]
+                file_summaries = [f.get("classification", {}).get("summary", "") for f in latest_files]
+                
+                # Create intent query from file context
+                synthetic_query = f"Process {', '.join(set(file_types))}. {' '.join(file_summaries)}"
+                logger.info(f"🔍 Synthesized query from files: {synthetic_query}")
+                
+                # Try to match workflow based on file context
+                matched = self.matcher.match_by_keywords(synthetic_query, org_id)
+                if not matched:
+                    all_workflows = self.matcher.get_all_workflows(org_id)
+                    matched = self.gemini.match_intent_to_workflow(synthetic_query, all_workflows)
+                
+                if matched:
+                    # Workflow identified from file context!
+                    logger.info(f"✅ Auto-identified workflow from files: {matched.get('workflowName')}")
+                    message = synthetic_query  # Use synthetic query for input extraction
+                else:
+                    file_names = [f.get("original_name") for f in latest_files]
+                    prompt = self.gemini.generate_contextual_response(
+                        f"User uploaded files without a message. Files classified as {', '.join(set(file_types))}. Ask what they'd like to do.",
+                        {"files": file_names},
+                    )
+                    await self.sessions.add_message(session_id, "assistant", prompt)
+                    return RouterResponse(
+                        session_id=session_id,
+                        status="idle",
+                        response=prompt,
+                        files_uploaded=files_uploaded if files_uploaded else None,
+                        total_session_files=len(session_files) or None,
+                    )
+            else:
+                file_names = [f.get("original_name", "") for f in session.get("uploaded_files", [])]
+                prompt = self.gemini.generate_contextual_response(
+                    "User uploaded files without a message. Ask what they'd like to do.",
+                    {"files": file_names},
+                )
+                await self.sessions.add_message(session_id, "assistant", prompt)
+                return RouterResponse(
+                    session_id=session_id,
+                    status="idle",
+                    response=prompt,
+                    files_uploaded=files_uploaded if files_uploaded else None,
+                )
 
         # Try keyword match first
         matched = self.matcher.match_by_keywords(message, org_id)
@@ -550,17 +605,17 @@ class RouterOrchestrator:
         should_execute = self.intent.should_auto_execute(message, all_collected)
 
         if should_execute:
-            # User wants to execute immediately
             return await self._execute_workflow_v2(session_id, session)
         else:
-            # Ask for confirmation
-            inputs_summary = "\n".join([
-                f"• {inp.get('label', inp['field'])}: {'✓' if inp.get('collected') else '✗'}"
-                for inp in updated_inputs
-            ])
-            prompt = self.intent.generate_confirmation_prompt(
-                matched.get("workflowName", ""),
-                inputs_summary,
+            # Dynamic confirmation prompt
+            wf_name = matched.get("workflowName", "")
+            collected_labels = [inp.get("label", inp["field"]) for inp in updated_inputs if inp.get("collected")]
+            prompt = self.gemini.generate_contextual_response(
+                f"All inputs for '{wf_name}' are collected. Ask the user to confirm execution.",
+                {
+                    "workflow_name": wf_name,
+                    "collected_inputs": collected_labels,
+                },
             )
             await self.sessions.add_message(session_id, "assistant", prompt)
             await self.sessions.update_workflow_status(session_id, "ready_to_execute")
@@ -616,8 +671,11 @@ class RouterOrchestrator:
             return await self._execute_workflow_v2(session_id, session)
 
         elif intent == "delay":
-            # User wants to wait/cancel
-            response_text = "No problem! Let me know when you're ready to proceed, or if you need to make changes."
+            wf_name = workflow.get("workflowName", "the workflow")
+            response_text = self.gemini.generate_contextual_response(
+                f"User wants to delay or cancel '{wf_name}'. Acknowledge and offer to wait.",
+                {"workflow_name": wf_name},
+            )
             await self.sessions.add_message(session_id, "assistant", response_text)
             return RouterResponse(
                 session_id=session_id,
@@ -630,14 +688,15 @@ class RouterOrchestrator:
         missing = self.collector.get_missing_inputs(required_inputs)
 
         if not missing:
-            # All inputs collected - ask for confirmation
-            inputs_summary = "\n".join([
-                f"• {inp.get('label', inp['field'])}: ✓"
-                for inp in required_inputs
-            ])
-            prompt = self.intent.generate_confirmation_prompt(
-                workflow.get("workflowName", ""),
-                inputs_summary,
+            # All inputs collected - dynamic confirmation
+            wf_name = workflow.get("workflowName", "")
+            collected_labels = [inp.get("label", inp["field"]) for inp in required_inputs if inp.get("collected")]
+            prompt = self.gemini.generate_contextual_response(
+                f"All inputs for '{wf_name}' are collected. Ask the user to confirm execution.",
+                {
+                    "workflow_name": wf_name,
+                    "collected_inputs": collected_labels,
+                },
             )
             await self.sessions.add_message(session_id, "assistant", prompt)
             await self.sessions.update_workflow_status(session_id, "ready_to_execute")
@@ -740,14 +799,15 @@ class RouterOrchestrator:
             # User confirmed in the same message (e.g., "yes" + file upload)
             return await self._execute_workflow_v2(session_id, session)
         else:
-            # Ask for confirmation before executing
-            inputs_summary = "\n".join([
-                f"• {inp.get('label', inp['field'])}: ✓"
-                for inp in updated_inputs
-            ])
-            prompt = self.intent.generate_confirmation_prompt(
-                workflow.get("workflowName", ""),
-                inputs_summary,
+            # Dynamic confirmation prompt
+            wf_name = workflow.get("workflowName", "")
+            collected_labels = [inp.get("label", inp["field"]) for inp in updated_inputs if inp.get("collected")]
+            prompt = self.gemini.generate_contextual_response(
+                f"All inputs for '{wf_name}' are collected. Ask the user to confirm execution.",
+                {
+                    "workflow_name": wf_name,
+                    "collected_inputs": collected_labels,
+                },
             )
             await self.sessions.add_message(session_id, "assistant", prompt)
             await self.sessions.update_workflow_status(session_id, "ready_to_execute")
@@ -857,15 +917,25 @@ class RouterOrchestrator:
                     }
                     
                     files_list = []
+                    temp_files = []  # Track temp files for cleanup
                     for field_name, file_info in request_data.get("file_fields", {}).items():
                         endpoint_name = file_info.get("endpoint_name", field_name)
                         file_paths = file_info.get("paths", [])
                         for fp in file_paths:
-                            if os.path.exists(fp):
+                            local_fp = fp
+                            # Download from blob if not local
+                            if not os.path.exists(fp) and self.files.storage_type == "azure":
+                                try:
+                                    local_fp = self.files.storage.download_to_local(fp)
+                                    temp_files.append(local_fp)
+                                except Exception as e:
+                                    logger.error(f"Failed to download blob for execution: {e}")
+                                    continue
+                            if os.path.exists(local_fp):
                                 # Use original filename from metadata, not stored filename
                                 original_name = file_path_to_name.get(fp, os.path.basename(fp))
                                 files_list.append(
-                                    (endpoint_name, (original_name, open(fp, "rb")))
+                                    (endpoint_name, (original_name, open(local_fp, "rb")))
                                 )
 
                     resp = await client.post(
@@ -877,6 +947,12 @@ class RouterOrchestrator:
 
                     for _, file_tuple in files_list:
                         file_tuple[1].close()
+                    # Cleanup temp downloads
+                    for tmp in temp_files:
+                        try:
+                            os.remove(tmp)
+                        except OSError:
+                            pass
                 else:
                     resp = await client.post(
                         url,
@@ -964,12 +1040,12 @@ class RouterOrchestrator:
         current_wf = session.get("current_workflow", {})
         collected_inputs = current_wf.get("collected_inputs", {})
         
-        # Find file paths used by this workflow
+        # Find file paths used by this workflow (blob paths valid even if not local)
         used_file_paths = []
         for field, value in collected_inputs.items():
             if isinstance(value, list):
-                used_file_paths.extend(v for v in value if isinstance(v, str) and os.path.exists(v))
-            elif isinstance(value, str) and os.path.exists(value):
+                used_file_paths.extend(v for v in value if isinstance(v, str))
+            elif isinstance(value, str) and "/" in value:
                 used_file_paths.append(value)
         
         # Mark files as used
@@ -1009,3 +1085,113 @@ class RouterOrchestrator:
     async def delete_session(self, session_id: str, user_id: str) -> bool:
         """Delete a session (only if it belongs to the user)."""
         return await self.sessions.delete_session(session_id, user_id)
+
+    async def _recheck_all_inputs(self, session_id: str, session: Dict[str, Any]):
+        """Re-evaluate all missing inputs against all session files. Called after every interaction."""
+        current_wf = session.get("current_workflow", {})
+        if not current_wf.get("workflow_id"):
+            return
+
+        required_inputs = current_wf.get("required_inputs", [])
+        session_files = session.get("uploaded_files", [])
+        workflow_name = current_wf.get("workflow_name", "")
+        matched_any = False
+
+        for inp in required_inputs:
+            if inp.get("type") == "file" and not inp.get("collected"):
+                best_file = self.file_intel.find_best_file_for_input(
+                    session_files, inp, workflow_name
+                )
+                if best_file:
+                    file_path = best_file.get("stored_path")
+                    if file_path:
+                        await self.sessions.mark_input_collected(
+                            session_id, inp["field"], [file_path]
+                        )
+                        matched_any = True
+                        logger.info(
+                            f"Recheck matched '{best_file.get('original_name')}' "
+                            f"-> {inp.get('label', inp['field'])} for '{workflow_name}'"
+                        )
+
+        # Auto-transition to ready_to_execute if all inputs now collected
+        if matched_any:
+            session = await self.sessions.get_session(session_id)
+            current_wf = session.get("current_workflow", {})
+            updated_inputs = current_wf.get("required_inputs", [])
+            still_missing = self.collector.get_missing_inputs(updated_inputs)
+            if not still_missing and current_wf.get("status") == "collecting":
+                await self.sessions.update_workflow_status(session_id, "ready_to_execute")
+    
+    def _get_pinecone_context(
+        self,
+        query: str,
+        session_id: str,
+        org_id: str,
+        run_id: Optional[str] = None,
+        top_k: int = 5,
+    ) -> Dict[str, Any]:
+        """
+        Retrieve relevant context from Pinecone using semantic search.
+        
+        Args:
+            query: Search query (current message or workflow description)
+            session_id: Current session ID
+            org_id: Organization ID
+            run_id: Optional run ID filter
+            top_k: Number of results to retrieve
+        
+        Returns:
+            Dict with relevant_messages and relevant_files
+        """
+        context = {
+            "relevant_messages": [],
+            "relevant_files": [],
+        }
+        
+        # Search for relevant messages
+        message_matches = pinecone_client.search_context(
+            query=query,
+            org_id=org_id,
+            session_id=session_id,
+            run_id=run_id,
+            top_k=top_k,
+            filter_type="message",
+        )
+        
+        for match in message_matches:
+            metadata = match.get("metadata", {})
+            context["relevant_messages"].append({
+                "content": metadata.get("content", ""),
+                "role": metadata.get("role", ""),
+                "timestamp": metadata.get("timestamp", ""),
+                "score": match.get("score", 0),
+                "workflow_name": metadata.get("workflow_name"),
+            })
+        
+        # Search for relevant files
+        file_matches = pinecone_client.search_context(
+            query=query,
+            org_id=org_id,
+            session_id=session_id,
+            run_id=run_id,
+            top_k=top_k,
+            filter_type="file",
+        )
+        
+        for match in file_matches:
+            metadata = match.get("metadata", {})
+            context["relevant_files"].append({
+                "filename": metadata.get("filename", ""),
+                "file_id": metadata.get("file_id", ""),
+                "content_preview": metadata.get("content_preview", ""),
+                "score": match.get("score", 0),
+                "classification": metadata.get("classification"),
+            })
+        
+        logger.debug(
+            f"🔍 Pinecone context: {len(context['relevant_messages'])} messages, "
+            f"{len(context['relevant_files'])} files"
+        )
+        
+        return context

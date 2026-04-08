@@ -3,6 +3,11 @@ Universal File Handler for the LLM Router.
 Supports ANY file type: PDF, images, video, audio, Excel, JSON, etc.
 Files are stored in Azure Blob Storage or local (environment-driven).
 Hierarchical path: knowledge-base/<orgId>/<userId>/<sessionId>/<runId>/<stage>/...
+
+Pinecone Integration:
+- Extracts text content from uploaded files
+- Embeds content using Pinecone's llama-text-embed-v2 model
+- Stores vectors with metadata for semantic search
 """
 import os
 import re
@@ -10,10 +15,12 @@ import tempfile
 import logging
 import mimetypes
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from utils.storage_factory import get_storage_backend
 from utils.config import STORAGE_BACKEND
+from components.PineconeClient import pinecone_client
+from components.TextExtractor import text_extractor
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +87,7 @@ class FileHandler:
                     org_id=org_id,
                     user_id=user_id,
                     session_id=session_id,
-                    run_id=run_id or session_id,
+                    run_id=run_id,
                     stage=stage,
                     metadata=metadata,
                 )
@@ -100,7 +107,17 @@ class FileHandler:
                 }
 
                 stored_files.append(file_info)
-                logger.info(f"📎 File uploaded: {original_name} ({file_size / 1024:.1f}KB) [{stage}]")
+                logger.info(f"File uploaded: {original_name} ({file_size / 1024:.1f}KB) [{stage}]")
+                
+                # Embed file content in Pinecone using in-memory bytes
+                self._embed_file_in_pinecone(
+                    file_info=file_info,
+                    file_bytes=content,
+                    session_id=session_id,
+                    user_id=user_id,
+                    org_id=org_id,
+                    run_id=run_id,
+                )
 
             except Exception as e:
                 logger.error(f"❌ Failed to upload {original_name}: {e}")
@@ -143,4 +160,40 @@ class FileHandler:
     def _sanitize_filename(self, filename: str) -> str:
         safe = re.sub(r"[^a-zA-Z0-9._\-]", "_", filename)
         return safe[:200]
+    
+    def _embed_file_in_pinecone(
+        self,
+        file_info: Dict[str, Any],
+        file_bytes: bytes,
+        session_id: str,
+        user_id: str,
+        org_id: str,
+        run_id: Optional[str] = None,
+    ):
+        """Extract text from in-memory bytes and embed in Pinecone."""
+        try:
+            mime_type = file_info.get("mime_type", "")
+            text_content = text_extractor.extract_text_from_bytes(file_bytes, mime_type)
+            
+            if not text_content:
+                logger.debug(f"No text content extracted from {file_info['original_name']}")
+                return
+            
+            success = pinecone_client.embed_and_upsert_file(
+                session_id=session_id,
+                file_id=file_info["file_id"],
+                filename=file_info["original_name"],
+                content=text_content,
+                user_id=user_id,
+                org_id=org_id,
+                run_id=run_id,
+                mime_type=mime_type,
+                classification=file_info.get("classification"),
+            )
+            
+            if success:
+                logger.info(f"🔍 File embedded in Pinecone: {file_info['original_name']}")
+        
+        except Exception as e:
+            logger.error(f"Failed to embed file in Pinecone: {e}")
 

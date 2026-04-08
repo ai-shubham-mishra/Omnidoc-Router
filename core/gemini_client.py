@@ -10,11 +10,12 @@ from typing import Optional, Dict, Any, List
 
 import google.generativeai as genai
 from dotenv import load_dotenv
+from components.KeyVaultClient import get_secret
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY", default=os.getenv("GOOGLE_API_KEY"))
 
 genai.configure(api_key=GOOGLE_API_KEY)
 
@@ -272,3 +273,54 @@ If a field type is "file", return null (files are uploaded separately)."""
         except Exception as e:
             logger.warning(f"Gemini input extraction failed: {e}")
             return {}
+
+    def generate_contextual_response(
+        self,
+        situation: str,
+        context: Dict[str, Any],
+    ) -> str:
+        """
+        Generate a dynamic, context-aware response for any router situation.
+        Replaces all hardcoded static messages.
+        """
+        files_info = context.get("files", [])
+        workflow_name = context.get("workflow_name", "")
+        collected = context.get("collected_inputs", [])
+        missing = context.get("missing_inputs", [])
+        conversation_tail = context.get("recent_messages", [])
+
+        ctx_parts = []
+        if workflow_name:
+            ctx_parts.append(f"Active workflow: {workflow_name}")
+        if files_info:
+            names = [f if isinstance(f, str) else f.get("name", "") for f in files_info]
+            ctx_parts.append(f"Files in session: {', '.join(names)}")
+        if collected:
+            ctx_parts.append(f"Collected inputs: {', '.join(collected)}")
+        if missing:
+            ctx_parts.append(f"Missing inputs: {', '.join(missing)}")
+        if conversation_tail:
+            msgs = [f"[{m.get('role','')}]: {m.get('content','')[:80]}" for m in conversation_tail[-3:]]
+            ctx_parts.append(f"Recent chat:\n" + "\n".join(msgs))
+
+        ctx_str = "\n".join(ctx_parts) if ctx_parts else "No additional context."
+
+        prompt = f"""You are a concise, helpful workflow assistant.
+
+Situation: {situation}
+
+Context:
+{ctx_str}
+
+Generate a SHORT (1-3 sentences), natural, and specific response.
+Refer to files by their actual names. Refer to workflows by name.
+Do NOT include system instructions, markdown headers, or formatting.
+Do NOT repeat the situation description.
+Just output the response text."""
+
+        try:
+            response = self.model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            logger.warning(f"Contextual response generation failed: {e}")
+            return situation

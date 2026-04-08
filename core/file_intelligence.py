@@ -10,16 +10,18 @@ Phase 4: File context for RAG-style queries
 import os
 import json
 import logging
+import time
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 
 import google.generativeai as genai
 from dotenv import load_dotenv
+from components.KeyVaultClient import get_secret
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY", default=os.getenv("GOOGLE_API_KEY"))
 genai.configure(api_key=GOOGLE_API_KEY)
 
 
@@ -44,6 +46,7 @@ class FileIntelligence:
         """
         Classify a file by its name, mime type, and extension.
         Uses Gemini to infer the document type and generate a short summary.
+        Falls back to basic classification if Gemini is unavailable (rate limits).
 
         Args:
             file_info: Dict with original_name, mime_type, size_bytes
@@ -55,7 +58,10 @@ class FileIntelligence:
         mime_type = file_info.get("mime_type", "application/octet-stream")
         size_bytes = file_info.get("size_bytes", 0)
 
-        prompt = f"""Classify this uploaded document based on its filename and type.
+        # Try Gemini classification with retry
+        for attempt in range(2):
+            try:
+                prompt = f"""Classify this uploaded document based on its filename and type.
 
 Filename: "{original_name}"
 MIME type: {mime_type}
@@ -70,29 +76,82 @@ Return format:
   "confidence": <0.0-1.0>
 }}"""
 
-        try:
-            response = self.model.generate_content(prompt)
-            text = response.text.strip()
-            if text.startswith("```"):
-                text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
+                response = self.model.generate_content(prompt)
+                text = response.text.strip()
+                if text.startswith("```"):
+                    text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+                if text.endswith("```"):
+                    text = text[:-3]
+                text = text.strip()
 
-            classification = json.loads(text)
-            logger.info(
-                f"📄 Classified '{original_name}' as '{classification.get('document_type')}' "
-                f"(confidence: {classification.get('confidence', 0):.0%})"
-            )
-            return classification
+                classification = json.loads(text)
+                logger.info(
+                    f"Classified '{original_name}' as '{classification.get('document_type')}' "
+                    f"(confidence: {classification.get('confidence', 0):.0%})"
+                )
+                return classification
 
-        except Exception as e:
-            logger.warning(f"File classification failed for '{original_name}': {e}")
+            except Exception as e:
+                if "429" in str(e) or "Resource exhausted" in str(e):
+                    logger.warning(f"Gemini rate limit hit (attempt {attempt + 1}/2), falling back to basic classification")
+                    break  # Don't retry on rate limit
+                elif attempt == 0:
+                    time.sleep(1)  # Brief retry for transient errors
+                    continue
+                else:
+                    logger.warning(f"File classification failed for '{original_name}': {e}")
+                    break
+
+        # Fallback: Basic classification from filename patterns
+        return self._fallback_classify(original_name, mime_type)
+
+    def _fallback_classify(self, filename: str, mime_type: str) -> Dict[str, Any]:
+        """Basic filename-based classification when Gemini is unavailable."""
+        filename_lower = filename.lower()
+        
+        # Pattern matching for common document types
+        if any(kw in filename_lower for kw in ["po", "purchase", "order", "procurement"]):
+            return {
+                "document_type": "purchase_order",
+                "summary": f"Purchase order document: {filename}",
+                "keywords": ["purchase_order", "po", "procurement"],
+                "confidence": 0.7,
+            }
+        elif any(kw in filename_lower for kw in ["invoice", "bill", "receipt"]):
+            return {
+                "document_type": "invoice",
+                "summary": f"Invoice or billing document: {filename}",
+                "keywords": ["invoice", "billing"],
+                "confidence": 0.7,
+            }
+        elif any(kw in filename_lower for kw in ["contract", "agreement"]):
+            return {
+                "document_type": "contract",
+                "summary": f"Contract or agreement: {filename}",
+                "keywords": ["contract", "agreement"],
+                "confidence": 0.7,
+            }
+        elif mime_type.startswith("image/"):
+            return {
+                "document_type": "image",
+                "summary": f"Image file: {filename}",
+                "keywords": ["image"],
+                "confidence": 0.8,
+            }
+        elif "spreadsheet" in mime_type or filename_lower.endswith((".xlsx", ".xls", ".csv")):
+            return {
+                "document_type": "spreadsheet",
+                "summary": f"Spreadsheet document: {filename}",
+                "keywords": ["spreadsheet", "data"],
+                "confidence": 0.8,
+            }
+        else:
+            ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
             return {
                 "document_type": "unknown",
-                "summary": f"Uploaded file: {original_name}",
-                "keywords": [original_name.rsplit(".", 1)[-1].lower()] if "." in original_name else [],
-                "confidence": 0.3,
+                "summary": f"Uploaded file: {filename}",
+                "keywords": [ext] if ext else [],
+                "confidence": 0.5,
             }
 
     # ==================== Phase 3: Smart File Matching ====================
@@ -196,12 +255,11 @@ Return format:
 
         candidates = []
         for f in session_files:
-            # Skip inaccessible, missing, or already-used files
             if not f.get("accessible", True):
                 continue
             if f.get("status", "available") != "available":
                 continue
-            if not os.path.exists(f.get("stored_path", "")):
+            if not f.get("stored_path"):
                 continue
 
             score = self.match_file_to_input(f, input_spec, workflow_name)
@@ -367,24 +425,48 @@ Return format:
     ) -> str:
         """
         Answer a user's question about the session using context.
+        Now enhanced with Pinecone semantic search for long-term memory.
         Handles questions like:
         - "Which document are you referring to?"
         - "What files have I uploaded?"
         - "What happened with the PO?"
+        - "What did I upload last week?"
 
         Args:
             question: User's question
-            session_context: Context from build_session_context()
+            session_context: Context from build_session_context() + Pinecone context
 
         Returns:
             Natural language answer
         """
-        prompt = f"""You are a helpful workflow assistant. Answer the user's question based on the current session context.
+        # Extract Pinecone context if available
+        pinecone_context = session_context.pop("pinecone_context", None)
+        
+        context_text = json.dumps(session_context, indent=2, default=str)
+        
+        # Add Pinecone context separately for clarity
+        pinecone_hint = ""
+        if pinecone_context:
+            relevant_messages = pinecone_context.get("relevant_messages", [])
+            relevant_files = pinecone_context.get("relevant_files", [])
+            
+            if relevant_messages or relevant_files:
+                pinecone_hint = "\n\nRelevant past context (from semantic search):\n"
+                if relevant_messages:
+                    pinecone_hint += "Messages:\n"
+                    for msg in relevant_messages[:3]:
+                        pinecone_hint += f"  - [{msg['role']}]: {msg['content'][:100]}...\n"
+                if relevant_files:
+                    pinecone_hint += "Files:\n"
+                    for f in relevant_files[:3]:
+                        pinecone_hint += f"  - {f['filename']}: {f['content_preview'][:80]}...\n"
+        
+        prompt = f"""You are a helpful workflow assistant. Answer the user's question based on the current session context and past relevant context.
 
 User question: "{question}"
 
-Session context:
-{json.dumps(session_context, indent=2, default=str)}
+Current session context:
+{context_text}{pinecone_hint}
 
 Rules:
 - Be concise (2-4 sentences max)
@@ -392,6 +474,7 @@ Rules:
 - If asking about a file, explain its document type and which workflow it was used for (or if it's still available)
 - If asking about current workflow status, explain what inputs are collected (with filenames if applicable) and what's still missing
 - If asking about past workflow results (e.g., "what was the PO number?", "what was extracted?"), look in the completed_workflows result_data or result_summary fields and quote specific values
+- Use the semantic search results to answer questions about past uploads or conversations beyond current session
 - Distinguish between files used by completed workflows (status: "used") and files still available for new workflows (status: "available")
 - If the context contains result data from completed workflows, use it to answer factual questions about those results
 - If the question can't be answered from context, say so honestly and suggest the user check the workflow output directly
@@ -444,5 +527,5 @@ Rules:
             f for f in session_files
             if f.get("status", "available") == "available"
             and f.get("accessible", True)
-            and os.path.exists(f.get("stored_path", ""))
+            and f.get("stored_path")
         ]
