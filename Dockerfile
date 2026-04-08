@@ -25,6 +25,7 @@ COPY handlers/ ./handlers/
 COPY models/ ./models/
 COPY auth/ ./auth/
 COPY utils/ ./utils/
+COPY components/ ./components/
 
 EXPOSE 8500
 
