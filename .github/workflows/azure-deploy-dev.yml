@@ -89,7 +89,7 @@ jobs:
                 --name ${{ env.CONTAINER_APP_NAME }} \
                 --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
                 --environment ${{ env.CONTAINER_APP_ENV }} \
-                --image ${{ steps.acr-creds.outputs.ACR_LOGIN_SERVER }}/omnidoc-router:dev \
+                --image ${{ steps.acr-creds.outputs.ACR_LOGIN_SERVER }}/omnidoc-router:dev-${{ github.sha }} \
                 --target-port 8500 \
                 --ingress external \
                 --registry-server ${{ steps.acr-creds.outputs.ACR_LOGIN_SERVER }} \
@@ -124,7 +124,7 @@ jobs:
               az containerapp update \
                 --name ${{ env.CONTAINER_APP_NAME }} \
                 --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-                --image ${{ steps.acr-creds.outputs.ACR_LOGIN_SERVER }}/omnidoc-router:dev
+                --image ${{ steps.acr-creds.outputs.ACR_LOGIN_SERVER }}/omnidoc-router:dev-${{ github.sha }}
               
               echo "✅ Image and secrets updated successfully"
             fi
@@ -136,7 +136,7 @@ jobs:
               --name ${{ env.CONTAINER_APP_NAME }} \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
               --environment ${{ env.CONTAINER_APP_ENV }} \
-              --image ${{ steps.acr-creds.outputs.ACR_LOGIN_SERVER }}/omnidoc-router:dev \
+              --image ${{ steps.acr-creds.outputs.ACR_LOGIN_SERVER }}/omnidoc-router:dev-${{ github.sha }} \
               --target-port 8500 \
               --ingress external \
               --registry-server ${{ steps.acr-creds.outputs.ACR_LOGIN_SERVER }} \
