@@ -1,8 +1,11 @@
 from fastapi import FastAPI, Request, Depends, UploadFile, File, Form
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, List
 import logging
+import os
+
+from dotenv import load_dotenv
 
 from auth.middleware import JWTAuthMiddleware
 from auth.models import UserContext
@@ -19,8 +22,7 @@ from models.api_contracts import (
 )
 from utils.config import API_VERSION, LAST_UPDATED
 from utils.redis_client import redis_client
-
-from dotenv import load_dotenv
+from components.FileMiddleware import file_middleware
 
 load_dotenv()
 
@@ -82,15 +84,17 @@ async def router_message(
     session_id: Optional[str] = Form(None),
     message: str = Form(""),
     files: List[UploadFile] = File([]),
+    file_ids: Optional[str] = Form(None),
     user_context: UserContext = Depends(get_current_user),
 ):
     """
     Unified endpoint for conversational workflow orchestration.
-    Accepts multipart/form-data with message + files in single request.
+    Accepts multipart/form-data with message + files + file_ids in single request.
     
     - Send message to chat
-    - Upload files to session context
-    - Or both simultaneously
+    - Upload files to session context (files → middleware → file_ids)
+    - Reference existing files via file_ids (for reruns, cross-workflow)
+    - Or all simultaneously
     
     Session ID Priority:
     1. X-Session-Id header (required - frontend always provides)
@@ -112,11 +116,22 @@ async def router_message(
             response="Session ID is required. Provide X-Session-Id header.",
             error=ErrorDetail(code="MISSING_SESSION_ID", message="X-Session-Id header is required"),
         )
+    
+    # Parse file_ids (comes as comma-separated string or JSON array)
+    parsed_file_ids = []
+    if file_ids:
+        import json
+        try:
+            parsed_file_ids = json.loads(file_ids) if file_ids.startswith('[') else file_ids.split(',')
+            parsed_file_ids = [fid.strip() for fid in parsed_file_ids if fid.strip()]
+        except:
+            parsed_file_ids = []
 
     result = await router_orchestrator.handle_message(
         message=message,
         session_id=final_session_id,
         files=files if files else [],
+        file_ids=parsed_file_ids,
         user_id=user_id,
         org_id=org_id,
         jwt_token=jwt_token,
@@ -269,6 +284,72 @@ async def router_delete_session(
         content={"status": "ok", "message": "Session deleted", "session_id": session_id},
         status_code=200,
     )
+
+
+# ============== File Middleware Endpoints ==============
+
+@app.post("/api/files/upload")
+async def upload_files(
+    files: List[UploadFile],
+    user_context: UserContext = Depends(get_current_user),
+    session_id: Optional[str] = Form(None)
+):
+    """
+    Standalone file upload endpoint.
+    Uploads files to middleware, returns file_ids for later use.
+    """
+    uploaded = await file_middleware.upload_files(
+        files=files,
+        user_id=user_context.user_id,
+        org_id=user_context.raw_payload.get("organizationId", ""),
+        session_id=session_id
+    )
+    
+    return JSONResponse({
+        "status": "success",
+        "files": uploaded
+    })
+
+
+@app.get("/api/files/{file_id}/metadata")
+async def get_file_metadata(
+    file_id: str,
+    user_context: UserContext = Depends(get_current_user)
+):
+    """Get file metadata without downloading."""
+    metadata = file_middleware.get_file_metadata_by_id(file_id)
+    
+    if not metadata:
+        return JSONResponse(
+            {"error": "File not found"},
+            status_code=404
+        )
+    
+    return JSONResponse(metadata)
+
+
+@app.get("/api/files/{file_id}/download")
+async def download_file(
+    file_id: str,
+    user_context: UserContext = Depends(get_current_user)
+):
+    """Download file by ID."""
+    try:
+        metadata = file_middleware.get_file_metadata_by_id(file_id)
+        if not metadata:
+            return JSONResponse({"error": "File not found"}, status_code=404)
+        
+        file_bytes = file_middleware.download_file(file_id, as_bytes=True)
+        
+        return Response(
+            content=file_bytes,
+            media_type=metadata["mime_type"],
+            headers={
+                "Content-Disposition": f"attachment; filename={metadata['original_name']}"
+            }
+        )
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # ============== Health & Info ==============

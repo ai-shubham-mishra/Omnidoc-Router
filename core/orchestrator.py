@@ -27,6 +27,8 @@ from handlers.file_handler import FileHandler
 from utils.intent_detector import IntentDetector
 from components.PineconeClient import pinecone_client
 from components.KeyVaultClient import get_secret
+from components.FileMiddleware import file_middleware
+
 from models.api_contracts import (
     RouterResponse,
     WorkflowIdentified,
@@ -62,27 +64,34 @@ class RouterOrchestrator:
         self.files = FileHandler()
         self.intent = IntentDetector()
         self.file_intel = FileIntelligence()
+        self.file_middleware = file_middleware
 
     async def handle_message(
         self,
         message: str,
         session_id: Optional[str],
-        files: List,
-        user_id: str,
-        org_id: str,
-        jwt_token: str,
+        files: List = None,
+        file_ids: List[str] = None,
+        user_id: str = "",
+        org_id: str = "",
+        jwt_token: str = "",
     ) -> RouterResponse:
         """
         Unified message handler for conversational workflow orchestration.
-        Handles: chat messages, file uploads, intent detection, multi-workflow sessions.
+        Handles: chat messages, file uploads, file_ids, intent detection, multi-workflow sessions.
         
         Key Features:
-        - Files stored as context (not auto-execute)
+        - Accepts both raw files and file_ids
+        - Files uploaded via middleware → file_ids stored in session
+        - File_ids validated via middleware → stored in session
         - Explicit execution intent required
         - Multi-workflow support
         - Session persists across workflows
-        - Session ID must be provided by frontend (never auto-generated)
         """
+        # Ensure defaults
+        files = files or []
+        file_ids = file_ids or []
+        
         # 1. Validate session_id is provided
         if not session_id:
             return RouterResponse(
@@ -94,48 +103,63 @@ class RouterOrchestrator:
         # 2. Get or create session with provided ID
         session = await self.sessions.get_session(session_id)
         if not session:
-            # Session doesn't exist - create new one with frontend-provided ID
             session = self.sessions.create_session(session_id, user_id, org_id, jwt_token)
             logger.info(f"Created new session with frontend ID: {session_id[:8]}...")
         else:
-            # Session exists - update JWT token
             await self.sessions.update_jwt_token(session_id, jwt_token)
 
-        # 3. Handle file uploads (add to context with classification)
+        # 3A. Handle raw file uploads → Upload to middleware → Get file_ids
+        from datetime import datetime
         files_uploaded = []
-        if files:
-            stored_files = await self.files.save_files_to_session(
-                session_id, files, user_id=user_id, org_id=org_id
+        new_file_ids = []
+        
+        if files and len(files) > 0:
+            uploaded = await self.file_middleware.upload_files(
+                files=files,
+                user_id=user_id,
+                org_id=org_id,
+                session_id=session_id
             )
             
-            # Classify each file for intelligent matching
-            current_wf = session.get("current_workflow", {})
-            active_workflow_name = current_wf.get("workflow_name")
-            for f in stored_files:
-                f["classification"] = self.file_intel.classify_file(f)
-                f["status"] = "available"
-                f["used_by_workflows"] = []
-                if active_workflow_name:
-                    f["uploaded_during_workflow"] = active_workflow_name
-            
-            await self.sessions.add_files(session_id, stored_files)
+            new_file_ids = [f["file_id"] for f in uploaded]
             files_uploaded = [
                 FileUploaded(
                     file_id=f["file_id"],
                     original_name=f["original_name"],
                     mime_type=f["mime_type"],
                     size_bytes=f["size_bytes"],
-                    uploaded_at=f["uploaded_at"],
+                    uploaded_at=datetime.utcnow().isoformat(),
                 )
-                for f in stored_files
+                for f in uploaded
             ]
-            logger.info(f"📎 {len(files)} file(s) classified and added to session context")
+            logger.info(f"📤 {len(files)} file(s) uploaded → middleware → {len(new_file_ids)} file_ids")
+        
+        # 3B. Handle file_ids → Validate via middleware
+        validated_file_ids = []
+        if file_ids and len(file_ids) > 0:
+            validated = self.file_middleware.validate_file_ids(
+                file_ids=file_ids,
+                user_id=user_id,
+                org_id=org_id
+            )
+            validated_file_ids = validated
+            logger.info(f"🔗 {len(validated)} file_ids validated for session")
+        
+        # 3C. Combine all file_ids and add to session
+        all_file_ids = new_file_ids + validated_file_ids
+        if all_file_ids:
+            await self.sessions.add_file_ids(session_id, all_file_ids)
+            # Force cache clear to ensure fresh read from MongoDB
+            # Use the proper delete_session method which has built-in error handling
+            deleted = await self.sessions.redis.delete_session(session_id)
+            if deleted:
+                logger.debug(f"🗑️ Cleared Redis cache for session: {session_id[:8]}...")
 
         # 3. Add message to conversation (if provided)
         if message:
             await self.sessions.add_message(session_id, "user", message)
 
-        # 4. Refresh session to get latest state
+        # 4. Refresh session to get latest state (fetches from MongoDB if cache was cleared)
         session = await self.sessions.get_session(session_id)
         current_wf = session.get("current_workflow", {})
         wf_status = current_wf.get("status", "idle")
@@ -275,8 +299,16 @@ class RouterOrchestrator:
                     workflow_identified=wf_identified,
                     inputs_required=inputs_list,
                     files_uploaded=files_uploaded if files_uploaded else None,
-                    total_session_files=len(session.get("uploaded_files", [])) or None,
+                    total_session_files=len(session.get("file_ids", [])) or None,
                 )
+
+        # 5c. Handle rerun requests (before new workflow matching)
+        if message and wf_status == "idle":
+            rerun_result = await self._handle_rerun_request(
+                session_id, session, message, user_id, org_id, jwt_token, files_uploaded
+            )
+            if rerun_result:
+                return rerun_result
 
         # 6. Handle idle or collecting states
         if wf_status == "idle":
@@ -433,6 +465,120 @@ class RouterOrchestrator:
             jwt_token=jwt_token,
         )
 
+    async def _handle_rerun_request(
+        self,
+        session_id: str,
+        session: Dict[str, Any],
+        message: str,
+        user_id: str,
+        org_id: str,
+        jwt_token: str,
+        files_uploaded: Optional[List] = None,
+    ) -> Optional[RouterResponse]:
+        """
+        Detect and handle workflow rerun requests.
+        Returns RouterResponse if rerun detected, None otherwise.
+        """
+        message_lower = message.lower()
+        
+        # Detect rerun intent
+        rerun_keywords = ["rerun", "run again", "redo", "repeat", "do it again", "execute again"]
+        if not any(keyword in message_lower for keyword in rerun_keywords):
+            return None
+        
+        workflow_history = session.get("workflow_history", [])
+        if not workflow_history:
+            response_msg = "No previous workflows to rerun. Please start a new workflow."
+            await self.sessions.add_message(session_id, "assistant", response_msg)
+            return RouterResponse(
+                session_id=session_id,
+                status="idle",
+                response=response_msg,
+                files_uploaded=files_uploaded,
+            )
+        
+        # Determine which workflow to rerun
+        target_workflow = None
+        
+        # Check for "last" or "previous"
+        if "last" in message_lower or "previous" in message_lower:
+            target_workflow = workflow_history[-1]
+        else:
+            # Try to match workflow name from history
+            for wf in reversed(workflow_history):
+                wf_name_lower = wf.get("workflow_name", "").lower()
+                if wf_name_lower and wf_name_lower in message_lower:
+                    target_workflow = wf
+                    break
+            
+            # If no match, use last workflow
+            if not target_workflow:
+                target_workflow = workflow_history[-1]
+        
+        # Check if workflow completed successfully
+        if target_workflow.get("status") != "completed":
+            response_msg = f"Cannot rerun '{target_workflow.get('workflow_name')}' - it {target_workflow.get('status')}. Only completed workflows can be rerun."
+            await self.sessions.add_message(session_id, "assistant", response_msg)
+            return RouterResponse(
+                session_id=session_id,
+                status="idle",
+                response=response_msg,
+                files_uploaded=files_uploaded,
+            )
+        
+        logger.info(f"🔄 Rerun detected for: {target_workflow.get('workflow_name')}")
+        
+        # Restore file_ids from previous run
+        file_ids_used = target_workflow.get("file_ids_used", [])
+        if file_ids_used:
+            await self.sessions.add_file_ids(session_id, file_ids_used)
+            logger.info(f"📎 Restored {len(file_ids_used)} file_ids for rerun")
+        
+        # Fetch workflow details from registry
+        workflow_id = target_workflow.get("workflow_id")
+        workflows = self.matcher.get_all_workflows(org_id)
+        matched_workflow = None
+        for wf in workflows:
+            if wf.get("workflowId") == workflow_id:
+                matched_workflow = wf
+                break
+        
+        if not matched_workflow:
+            response_msg = f"Workflow '{target_workflow.get('workflow_name')}' not found in registry."
+            await self.sessions.add_message(session_id, "assistant", response_msg)
+            return RouterResponse(
+                session_id=session_id,
+                status="idle",
+                response=response_msg,
+                error=ErrorDetail(code="WORKFLOW_NOT_FOUND", message="Workflow no longer available"),
+                files_uploaded=files_uploaded,
+            )
+        
+        # Set up workflow context with restored inputs
+        required_inputs = self.collector.extract_required_inputs(matched_workflow)
+        await self.sessions.set_workflow_context(session_id, matched_workflow, required_inputs)
+        
+        # Restore collected inputs from previous run
+        previous_inputs = target_workflow.get("collected_inputs", {})
+        if previous_inputs:
+            session = await self.sessions.get_session(session_id)
+            current_wf = session.get("current_workflow", {})
+            
+            # Mark inputs as collected and set values
+            for field_name, value in previous_inputs.items():
+                await self.sessions.mark_input_collected(session_id, field_name, value)
+            
+            logger.info(f"🔄 Restored {len(previous_inputs)} input(s) from previous run")
+        
+        # Refresh session and proceed to execution
+        session = await self.sessions.get_session(session_id)
+        
+        rerun_msg = f"Rerunning '{target_workflow.get('workflow_name')}' with previous inputs and files..."
+        await self.sessions.add_message(session_id, "assistant", rerun_msg)
+        
+        # Execute the workflow
+        return await self._execute_workflow_v2(session_id, session)
+
     # ============== v2 Methods for Multi-Workflow Sessions ==============
 
     async def _identify_workflow_v2(
@@ -580,7 +726,7 @@ class RouterOrchestrator:
             await self.sessions.update_workflow_status(session_id, "collecting")
             
             # Get total session files count
-            session_files_count = len(session.get("uploaded_files", []))
+            session_files_count = len(session.get("file_ids", []))
             
             return RouterResponse(
                 session_id=session_id,
@@ -621,7 +767,7 @@ class RouterOrchestrator:
             await self.sessions.update_workflow_status(session_id, "ready_to_execute")
             
             # Get total session files count
-            session_files_count = len(session.get("uploaded_files", []))
+            session_files_count = len(session.get("file_ids", []))
             
             return RouterResponse(
                 session_id=session_id,
@@ -702,7 +848,7 @@ class RouterOrchestrator:
             await self.sessions.update_workflow_status(session_id, "ready_to_execute")
             
             # Get total session files count
-            session_files_count = len(session.get("uploaded_files", []))
+            session_files_count = len(session.get("file_ids", []))
             
             return RouterResponse(
                 session_id=session_id,
@@ -774,7 +920,7 @@ class RouterOrchestrator:
             await self.sessions.add_message(session_id, "assistant", prompt)
             
             # Get total session files count
-            session_files_count = len(session.get("uploaded_files", []))
+            session_files_count = len(session.get("file_ids", []))
             
             return RouterResponse(
                 session_id=session_id,
@@ -813,7 +959,7 @@ class RouterOrchestrator:
             await self.sessions.update_workflow_status(session_id, "ready_to_execute")
             
             # Get total session files count
-            session_files_count = len(session.get("uploaded_files", []))
+            session_files_count = len(session.get("file_ids", []))
             
             return RouterResponse(
                 session_id=session_id,
@@ -890,7 +1036,14 @@ class RouterOrchestrator:
 
         run_id = str(uuid.uuid4())
         await self.sessions.set_run_id(session_id, run_id)
-        await self.sessions.update_workflow_status(session_id, "executing")
+        
+        # Track file_ids being used for rerun capability
+        session_file_ids = session.get("file_ids", [])
+        await self.sessions.update_workflow_status(
+            session_id, 
+            "executing",
+            file_ids_in_use=session_file_ids
+        )
 
         # Build request
         request_data = self.builder.build_workflow_request(
@@ -908,35 +1061,27 @@ class RouterOrchestrator:
                     for key, value in request_data["data"].items():
                         form_data[key] = str(value) if not isinstance(value, str) else value
 
-                    # Build file upload list with original filenames
-                    # Look up original_name from session.uploaded_files for each stored_path
-                    session_files = session.get("uploaded_files", [])
-                    file_path_to_name = {
-                        f.get("stored_path"): f.get("original_name", os.path.basename(f.get("stored_path", "")))
-                        for f in session_files
-                    }
-                    
+                    # FILE ID CONVERSION: Convert collected file_ids to binary files
+                    # Read file_ids from collected_inputs, not session (more precise)
                     files_list = []
-                    temp_files = []  # Track temp files for cleanup
-                    for field_name, file_info in request_data.get("file_fields", {}).items():
-                        endpoint_name = file_info.get("endpoint_name", field_name)
-                        file_paths = file_info.get("paths", [])
-                        for fp in file_paths:
-                            local_fp = fp
-                            # Download from blob if not local
-                            if not os.path.exists(fp) and self.files.storage_type == "azure":
-                                try:
-                                    local_fp = self.files.storage.download_to_local(fp)
-                                    temp_files.append(local_fp)
-                                except Exception as e:
-                                    logger.error(f"Failed to download blob for execution: {e}")
-                                    continue
-                            if os.path.exists(local_fp):
-                                # Use original filename from metadata, not stored filename
-                                original_name = file_path_to_name.get(fp, os.path.basename(fp))
-                                files_list.append(
-                                    (endpoint_name, (original_name, open(local_fp, "rb")))
+                    
+                    # Process each file-type input separately with correct field name
+                    for inp in required_inputs:
+                        if inp.get("type") in ("file", "files") and inp.get("collected"):
+                            field_name = inp.get("field")
+                            file_ids_for_input = collected_inputs.get(field_name, [])
+                            
+                            if file_ids_for_input and isinstance(file_ids_for_input, list):
+                                # Get API parameter name (endpoint_field_name) for this input
+                                api_field_name = inp.get("endpoint_field_name", field_name)
+                                
+                                logger.info(f"Converting {len(file_ids_for_input)} file_id(s) for '{field_name}' → '{api_field_name}'")
+                                multipart_files = self.file_middleware.files_to_multipart(
+                                    file_ids=file_ids_for_input,
+                                    field_name=api_field_name  # Use API parameter name
                                 )
+                                files_list.extend(multipart_files)
+                                logger.info(f"✅ Converted {len(multipart_files)} file(s) for '{api_field_name}'")
 
                     resp = await client.post(
                         url,
@@ -945,14 +1090,10 @@ class RouterOrchestrator:
                         headers={"Authorization": request_data["headers"]["Authorization"]},
                     )
 
+                    # Close file handles
                     for _, file_tuple in files_list:
-                        file_tuple[1].close()
-                    # Cleanup temp downloads
-                    for tmp in temp_files:
-                        try:
-                            os.remove(tmp)
-                        except OSError:
-                            pass
+                        if hasattr(file_tuple[1], 'close'):
+                            file_tuple[1].close()
                 else:
                     resp = await client.post(
                         url,
@@ -1087,32 +1228,38 @@ class RouterOrchestrator:
         return await self.sessions.delete_session(session_id, user_id)
 
     async def _recheck_all_inputs(self, session_id: str, session: Dict[str, Any]):
-        """Re-evaluate all missing inputs against all session files. Called after every interaction."""
+        """
+        Auto-collect file inputs using file_ids from session (new file_id architecture).
+        Called after file upload to immediately satisfy file input requirements.
+        File_ids are lightweight references - actual files downloaded via middleware during execution.
+        """
         current_wf = session.get("current_workflow", {})
         if not current_wf.get("workflow_id"):
             return
 
         required_inputs = current_wf.get("required_inputs", [])
-        session_files = session.get("uploaded_files", [])
-        workflow_name = current_wf.get("workflow_name", "")
+        file_ids = session.get("file_ids", [])
+        
+        if not file_ids:
+            return  # No files available to auto-collect
+        
         matched_any = False
 
+        # Auto-assign file_ids to uncollected file-type inputs
         for inp in required_inputs:
-            if inp.get("type") == "file" and not inp.get("collected"):
-                best_file = self.file_intel.find_best_file_for_input(
-                    session_files, inp, workflow_name
+            if inp.get("type") in ("file", "files") and not inp.get("collected"):
+                # IMPORTANT: Always store as LIST for consistency with request_builder expectations
+                # Single file input: list with one file_id ["abc-123"]
+                # Multi-file input: list with all file_ids ["abc-123", "def-456"]
+                file_value = [file_ids[0]] if inp.get("type") == "file" else file_ids
+                
+                await self.sessions.mark_input_collected(
+                    session_id, inp["field"], file_value
                 )
-                if best_file:
-                    file_path = best_file.get("stored_path")
-                    if file_path:
-                        await self.sessions.mark_input_collected(
-                            session_id, inp["field"], [file_path]
-                        )
-                        matched_any = True
-                        logger.info(
-                            f"Recheck matched '{best_file.get('original_name')}' "
-                            f"-> {inp.get('label', inp['field'])} for '{workflow_name}'"
-                        )
+                matched_any = True
+                logger.info(
+                    f"✅ Auto-collected '{inp.get('label', inp['field'])}' with {len(file_value)} file_id(s)"
+                )
 
         # Auto-transition to ready_to_execute if all inputs now collected
         if matched_any:
@@ -1120,8 +1267,10 @@ class RouterOrchestrator:
             current_wf = session.get("current_workflow", {})
             updated_inputs = current_wf.get("required_inputs", [])
             still_missing = self.collector.get_missing_inputs(updated_inputs)
+            
             if not still_missing and current_wf.get("status") == "collecting":
                 await self.sessions.update_workflow_status(session_id, "ready_to_execute")
+                logger.info(f"🚀 All inputs collected → status changed to 'ready_to_execute'")
     
     def _get_pinecone_context(
         self,

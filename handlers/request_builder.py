@@ -66,11 +66,12 @@ class RequestBuilder:
             # Get the API parameter name for this field
             api_field = field_mapping.get(router_field, router_field)
 
-            # File input: detect by schema type
-            if router_field in file_type_fields and isinstance(value, list):
-                file_fields[router_field] = {"paths": value, "endpoint_name": api_field}
-            else:
-                data_fields[api_field] = value
+            # Skip file-type fields - they're handled by orchestrator's file_id conversion
+            if router_field in file_type_fields:
+                continue
+            
+            # Non-file input: use API parameter name directly
+            data_fields[api_field] = value
 
         if "runId" not in data_fields and "runid" not in data_fields:
             data_fields["runId"] = run_id

@@ -83,11 +83,22 @@ class SessionManager:
             
             # Uploaded files (persistent context, not auto-execute)
             "uploaded_files": [],
+            
+            # File IDs for file-based workflow communication
+            "file_ids": [],
         }
         
         # Write to MongoDB (source of truth)
         self.collection.insert_one(session)
         logger.info(f"✅ Session created: {session_id[:8]}... (user: {user_id})")
+        
+        # Try to cache in Redis (non-blocking, graceful degradation)
+        try:
+            if self.redis.enabled:
+                import asyncio
+                asyncio.create_task(self.redis.set_session(session_id, session))
+        except Exception as e:
+            logger.debug(f"Redis cache create failed (non-critical): {e}")
         
         return session
 
@@ -136,10 +147,13 @@ class SessionManager:
             },
         )
         
-        # Update Redis cache
-        updated_session = self.collection.find_one({"_id": session_id})
-        if updated_session:
-            await self.redis.set_session(session_id, updated_session)
+        # Update Redis cache (graceful degradation if Redis unavailable)
+        try:
+            updated_session = self.collection.find_one({"_id": session_id})
+            if updated_session:
+                await self.redis.set_session(session_id, updated_session)
+        except Exception as e:
+            logger.debug(f"Redis cache update failed (non-critical): {e}")
         
         # Embed message in Pinecone for semantic search
         if session:
@@ -250,6 +264,30 @@ class SessionManager:
         
         logger.info(f"📎 {len(files_info)} file(s) added to context: {session_id[:8]}...")
 
+    async def add_file_ids(self, session_id: str, file_ids: List[str]):
+        """
+        Add file IDs to session context for file-based workflow communication.
+        File IDs are lightweight references to files stored in blob/DB.
+        """
+        if not file_ids:
+            return
+        
+        # Update MongoDB
+        self.collection.update_one(
+            {"_id": session_id},
+            {
+                "$addToSet": {"file_ids": {"$each": file_ids}},
+                "$set": {"last_active": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")},
+            },
+        )
+        
+        # Update Redis cache
+        updated_session = self.collection.find_one({"_id": session_id})
+        if updated_session:
+            await self.redis.set_session(session_id, updated_session)
+        
+        logger.info(f"🔗 {len(file_ids)} file_id(s) added to session: {session_id[:8]}...")
+
     async def update_files(self, session_id: str, updated_files: List[Dict[str, Any]]):
         """
         Replace all uploaded_files with updated list (e.g., after marking files as used).
@@ -292,8 +330,9 @@ class SessionManager:
         session_id: str,
         status: str,
         confirmation_data: Optional[Dict] = None,
+        file_ids_in_use: Optional[List[str]] = None,
     ):
-        """Update current workflow status."""
+        """Update current workflow status and track file_ids being used."""
         update_doc: Dict[str, Any] = {
             "current_workflow.status": status,
             "last_active": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -301,6 +340,9 @@ class SessionManager:
         
         if confirmation_data is not None:
             update_doc["current_workflow.confirmation_data"] = confirmation_data
+        
+        if file_ids_in_use is not None:
+            update_doc["current_workflow.file_ids_in_use"] = file_ids_in_use
 
         # Update MongoDB
         self.collection.update_one({"_id": session_id}, {"$set": update_doc})
@@ -333,7 +375,7 @@ class SessionManager:
         
         current_wf = session.get("current_workflow", {})
         
-        # Add to workflow history
+        # Add to workflow history with file_ids and inputs for rerun capability
         history_entry = {
             "workflow_id": current_wf.get("workflow_id"),
             "workflow_name": current_wf.get("workflow_name"),
@@ -342,6 +384,8 @@ class SessionManager:
             "status": status,
             "result": result,
             "completed_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "file_ids_used": current_wf.get("file_ids_in_use", []),
+            "collected_inputs": current_wf.get("collected_inputs", {}),
         }
         
         if result_summary:

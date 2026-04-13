@@ -38,23 +38,23 @@ class JWTAuthMiddleware(BaseHTTPMiddleware):
         if self._should_skip_auth(path):
             return await call_next(request)
 
+        # Authenticate BEFORE calling endpoint (narrow exception scope)
         try:
             user_context = await self._authenticate_request(request)
             request.state.user = user_context
-            response = await call_next(request)
-            return response
-
         except TokenExpiredError:
             logger.warning(f"Expired token for path: {path}")
             return self._create_auth_error_response("Token has expired", 401)
-
         except TokenInvalidError as e:
             logger.warning(f"Invalid token for path {path}: {str(e)}")
             return self._create_auth_error_response("Invalid or malformed token", 403)
-
         except Exception as e:
             logger.error(f"Auth error for path {path}: {str(e)}")
             return self._create_auth_error_response("Authentication failed", 403)
+        
+        # Call endpoint AFTER auth succeeded (errors here are business logic, not auth)
+        response = await call_next(request)
+        return response
 
     def _should_skip_auth(self, path: str) -> bool:
         """Check if path is excluded from authentication."""
