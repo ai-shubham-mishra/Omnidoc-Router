@@ -322,11 +322,10 @@ class RouterOrchestrator:
             )
 
         # Fallback
-        session_files = session.get("uploaded_files", [])
-        file_names = [f.get("original_name", "") for f in session_files]
+        file_ids = session.get("file_ids", [])
         response_text = self.gemini.generate_contextual_response(
             "User is idle with no active workflow. Ask what they'd like to do.",
-            {"files": file_names},
+            {"files_count": len(file_ids)},
         )
         await self.sessions.add_message(session_id, "assistant", response_text)
         return RouterResponse(
@@ -555,20 +554,24 @@ class RouterOrchestrator:
             )
         
         # Set up workflow context with restored inputs
-        required_inputs = self.collector.extract_required_inputs(matched_workflow)
+        required_inputs = self.collector.parse_workflow_inputs(matched_workflow)
+        required_inputs = self.collector.auto_fill_inputs(
+            required_inputs,
+            {"user_id": user_id, "org_id": org_id},
+        )
         await self.sessions.set_workflow_context(session_id, matched_workflow, required_inputs)
         
         # Restore collected inputs from previous run
         previous_inputs = target_workflow.get("collected_inputs", {})
         if previous_inputs:
-            session = await self.sessions.get_session(session_id)
-            current_wf = session.get("current_workflow", {})
-            
             # Mark inputs as collected and set values
             for field_name, value in previous_inputs.items():
                 await self.sessions.mark_input_collected(session_id, field_name, value)
             
             logger.info(f"🔄 Restored {len(previous_inputs)} input(s) from previous run")
+        
+        # Mark workflow as ready to execute (skip collection phase)
+        await self.sessions.update_workflow_status(session_id, "ready_to_execute")
         
         # Refresh session and proceed to execution
         session = await self.sessions.get_session(session_id)
@@ -595,55 +598,30 @@ class RouterOrchestrator:
         session = await self.sessions.get_session(session_id)
         
         if not message:
-            # File uploaded without message - use file classification to infer intent
-            session_files = session.get("uploaded_files", [])
-            if files_uploaded and session_files:
-                # Build synthetic query from file classifications
-                latest_files = session_files[-len(files_uploaded):]
-                file_types = [f.get("classification", {}).get("document_type", "document") for f in latest_files]
-                file_summaries = [f.get("classification", {}).get("summary", "") for f in latest_files]
-                
-                # Create intent query from file context
-                synthetic_query = f"Process {', '.join(set(file_types))}. {' '.join(file_summaries)}"
-                logger.info(f"🔍 Synthesized query from files: {synthetic_query}")
-                
-                # Try to match workflow based on file context
-                matched = self.matcher.match_by_keywords(synthetic_query, org_id)
-                if not matched:
-                    all_workflows = self.matcher.get_all_workflows(org_id)
-                    matched = self.gemini.match_intent_to_workflow(synthetic_query, all_workflows)
-                
-                if matched:
-                    # Workflow identified from file context!
-                    logger.info(f"✅ Auto-identified workflow from files: {matched.get('workflowName')}")
-                    message = synthetic_query  # Use synthetic query for input extraction
-                else:
-                    file_names = [f.get("original_name") for f in latest_files]
-                    prompt = self.gemini.generate_contextual_response(
-                        f"User uploaded files without a message. Files classified as {', '.join(set(file_types))}. Ask what they'd like to do.",
-                        {"files": file_names},
-                    )
-                    await self.sessions.add_message(session_id, "assistant", prompt)
-                    return RouterResponse(
-                        session_id=session_id,
-                        status="idle",
-                        response=prompt,
-                        files_uploaded=files_uploaded if files_uploaded else None,
-                        total_session_files=len(session_files) or None,
-                    )
-            else:
-                file_names = [f.get("original_name", "") for f in session.get("uploaded_files", [])]
+            # File uploaded without message - prompt for intent
+            file_ids = session.get("file_ids", [])
+            file_count = len(file_ids)
+            
+            if files_uploaded:
+                file_names = [f.get("original_name", "") for f in files_uploaded]
                 prompt = self.gemini.generate_contextual_response(
-                    "User uploaded files without a message. Ask what they'd like to do.",
+                    f"User uploaded {file_count} file(s) without a message. Ask what they'd like to do with these files.",
                     {"files": file_names},
                 )
-                await self.sessions.add_message(session_id, "assistant", prompt)
-                return RouterResponse(
-                    session_id=session_id,
-                    status="idle",
-                    response=prompt,
-                    files_uploaded=files_uploaded if files_uploaded else None,
+            else:
+                prompt = self.gemini.generate_contextual_response(
+                    "User uploaded files without a message. Ask what they'd like to do.",
+                    {"files_count": file_count},
                 )
+            
+            await self.sessions.add_message(session_id, "assistant", prompt)
+            return RouterResponse(
+                session_id=session_id,
+                status="idle",
+                response=prompt,
+                files_uploaded=files_uploaded if files_uploaded else None,
+                total_session_files=file_count if file_count > 0 else None,
+            )
 
         # Try keyword match first
         matched = self.matcher.match_by_keywords(message, org_id)
@@ -673,9 +651,16 @@ class RouterOrchestrator:
 
         await self.sessions.set_workflow_context(session_id, matched, required_inputs)
 
-        # Try to extract inputs from message and session files
+        # Auto-collect file inputs using file_ids from session (if any files uploaded)
         session = await self.sessions.get_session(session_id)
-        missing = self.collector.get_missing_inputs(required_inputs)
+        file_ids = session.get("file_ids", [])
+        if file_ids:
+            await self._recheck_all_inputs(session_id, session)
+            session = await self.sessions.get_session(session_id)
+        
+        # Try to extract text inputs from message
+        current_wf = session.get("current_workflow", {})
+        missing = self.collector.get_missing_inputs(current_wf.get("required_inputs", []))
 
         if missing:
             # Extract text inputs from message
@@ -683,26 +668,6 @@ class RouterOrchestrator:
             for field, value in extracted.items():
                 if value is not None:
                     await self.sessions.mark_input_collected(session_id, field, value)
-            
-            # Smart file matching (not blind auto-fill)
-            workflow_name = matched.get("workflowName", "")
-            for inp in missing:
-                if inp.get("type") == "file" and not inp.get("collected"):
-                    session_files = session.get("uploaded_files", [])
-                    if session_files:
-                        best_file = self.file_intel.find_best_file_for_input(
-                            session_files, inp, workflow_name
-                        )
-                        if best_file:
-                            file_path = best_file.get("stored_path")
-                            if file_path:
-                                await self.sessions.mark_input_collected(
-                                    session_id, inp["field"], [file_path]
-                                )
-                                logger.info(
-                                    f"✅ Smart-matched '{best_file.get('original_name')}' "
-                                    f"to {inp['field']} for '{workflow_name}'"
-                                )
 
         # Re-check missing inputs
         session = await self.sessions.get_session(session_id)
@@ -879,25 +844,11 @@ class RouterOrchestrator:
                 if value is not None:
                     await self.sessions.mark_input_collected(session_id, field, value)
 
-        # Smart file matching (not blind auto-fill)
-        workflow_name = workflow.get("workflowName", "")
-        for inp in missing:
-            if inp.get("type") == "file" and not inp.get("collected"):
-                session_files = session.get("uploaded_files", [])
-                if session_files:
-                    best_file = self.file_intel.find_best_file_for_input(
-                        session_files, inp, workflow_name
-                    )
-                    if best_file:
-                        file_path = best_file.get("stored_path")
-                        if file_path:
-                            await self.sessions.mark_input_collected(
-                                session_id, inp["field"], [file_path]
-                            )
-                            logger.info(
-                                f"✅ Smart-matched '{best_file.get('original_name')}' "
-                                f"to {inp['field']} for '{workflow_name}'"
-                            )
+        # Auto-collect file inputs using file_ids (if any files in session)
+        session = await self.sessions.get_session(session_id)
+        file_ids = session.get("file_ids", [])
+        if file_ids:
+            await self._recheck_all_inputs(session_id, session)
 
         # Refresh and re-check
         session = await self.sessions.get_session(session_id)
@@ -1038,11 +989,19 @@ class RouterOrchestrator:
         await self.sessions.set_run_id(session_id, run_id)
         
         # Track file_ids being used for rerun capability
-        session_file_ids = session.get("file_ids", [])
+        # Extract file_ids from collected_inputs (more precise than session.file_ids)
+        file_ids_in_use = []
+        for inp in required_inputs:
+            if inp.get("type") in ("file", "files") and inp.get("collected"):
+                field_name = inp.get("field")
+                file_ids_for_input = collected_inputs.get(field_name, [])
+                if isinstance(file_ids_for_input, list):
+                    file_ids_in_use.extend(file_ids_for_input)
+        
         await self.sessions.update_workflow_status(
             session_id, 
             "executing",
-            file_ids_in_use=session_file_ids
+            file_ids_in_use=file_ids_in_use
         )
 
         # Build request
