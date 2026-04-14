@@ -34,8 +34,10 @@ class WorkflowMatcher:
                 {
                     "$or": [
                         {"workflowType": "public"},
-                        {"idOrg": org_id},
-                        {"idClient": org_id},
+                        {"idOrg": org_id},              # Legacy: string match
+                        {"idOrg": {"$in": [org_id]}},   # New: array contains org_id
+                        {"idClient": org_id},            # Legacy: string match
+                        {"idClient": {"$in": [org_id]}}, # New: array contains org_id
                     ]
                 }
             )
