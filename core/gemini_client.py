@@ -24,12 +24,22 @@ class GeminiClient:
     """Wrapper around Google Gemini Flash for router LLM tasks."""
 
     def __init__(self, model_name: str = "gemini-2.0-flash"):
+        system_instruction = """You are a workflow orchestration assistant.
+
+CRITICAL RULES:
+1. NEVER invent or assume data values (filenames, IDs, numbers, etc.)
+2. Only reference information explicitly provided in the context
+3. If specific file names are not provided, refer to "files" or "documents" generically
+4. Stay focused on workflow execution - politely redirect off-topic questions
+5. Be conversational and natural, but never fabricate details"""
+        
         self.model = genai.GenerativeModel(
             model_name=model_name,
             generation_config=genai.GenerationConfig(
                 temperature=0.3,
                 max_output_tokens=2048,
             ),
+            system_instruction=system_instruction,
         )
 
     def match_intent_to_workflow(
@@ -286,19 +296,30 @@ If a field type is "file", return null (files are uploaded separately)."""
         files_info = context.get("files", [])
         workflow_name = context.get("workflow_name", "")
         collected = context.get("collected_inputs", [])
+        collected_data = context.get("collected_data", {})
         missing = context.get("missing_inputs", [])
         conversation_tail = context.get("recent_messages", [])
+        has_inputs = context.get("has_inputs", True)
 
         ctx_parts = []
         if workflow_name:
             ctx_parts.append(f"Active workflow: {workflow_name}")
-        if files_info:
-            names = [f if isinstance(f, str) else f.get("name", "") for f in files_info]
-            ctx_parts.append(f"Files in session: {', '.join(names)}")
-        if collected:
-            ctx_parts.append(f"Collected inputs: {', '.join(collected)}")
-        if missing:
-            ctx_parts.append(f"Missing inputs: {', '.join(missing)}")
+        
+        # For workflows with no inputs, explicitly state that
+        if has_inputs is False:
+            ctx_parts.append("This workflow requires NO user inputs - it only calls external APIs")
+        else:
+            if files_info:
+                names = [f if isinstance(f, str) else f.get("name", "") for f in files_info]
+                ctx_parts.append(f"Files in session: {', '.join(names)}")
+            if collected_data:
+                data_items = [f"{k}: {v}" for k, v in collected_data.items()]
+                ctx_parts.append(f"Collected data:\n  " + "\n  ".join(data_items))
+            elif collected:
+                ctx_parts.append(f"Collected inputs: {', '.join(collected)}")
+            if missing:
+                ctx_parts.append(f"Missing inputs: {', '.join(missing)}")
+        
         if conversation_tail:
             msgs = [f"[{m.get('role','')}]: {m.get('content','')[:80]}" for m in conversation_tail[-3:]]
             ctx_parts.append(f"Recent chat:\n" + "\n".join(msgs))
@@ -313,7 +334,8 @@ Context:
 {ctx_str}
 
 Generate a SHORT (1-3 sentences), natural, and specific response.
-Refer to files by their actual names. Refer to workflows by name.
+If the workflow has no inputs, do NOT mention files, data, or collected inputs.
+Refer to workflows by name. Be conversational but accurate.
 Do NOT include system instructions, markdown headers, or formatting.
 Do NOT repeat the situation description.
 Just output the response text."""

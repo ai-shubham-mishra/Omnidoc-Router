@@ -65,6 +65,23 @@ class RouterOrchestrator:
         self.intent = IntentDetector()
         self.file_intel = FileIntelligence()
         self.file_middleware = file_middleware
+    
+    def _format_value_for_display(self, value: Any, input_type: str) -> str:
+        """Format collected input value for safe LLM display."""
+        if input_type in ("file", "files"):
+            if isinstance(value, list):
+                count = len(value)
+                return f"{count} file{'s' if count != 1 else ''}"
+            return "1 file"
+        elif value == "__auto_runid__":
+            return "[auto-generated]"
+        elif value == "__hitl_field__":
+            return "[confirmation pending]"
+        elif value is None:
+            return "[not collected]"
+        else:
+            str_val = str(value)
+            return str_val[:100] + "..." if len(str_val) > 100 else str_val
 
     async def handle_message(
         self,
@@ -172,6 +189,26 @@ class RouterOrchestrator:
             current_wf = session.get("current_workflow", {})
             wf_status = current_wf.get("status", "idle")
 
+        # 4b. Check if organization has any workflows registered
+        if message and wf_status == "idle":
+            all_workflows = self.matcher.get_all_workflows(org_id)
+            if not all_workflows:
+                no_wf_msg = self.gemini.generate_contextual_response(
+                    "Organization has no registered workflows yet. Inform user they need workflow registration.",
+                    {"org_id": org_id}
+                )
+                await self.sessions.add_message(session_id, "assistant", no_wf_msg)
+                return RouterResponse(
+                    session_id=session_id,
+                    status="no_workflows",
+                    response=no_wf_msg,
+                    error=ErrorDetail(
+                        code="NO_WORKFLOWS_REGISTERED",
+                        message="No workflows available for this organization"
+                    ),
+                    files_uploaded=files_uploaded if files_uploaded else None,
+                )
+        
         # 5. State machine routing
         if wf_status == "awaiting_confirmation":
             # Check if user is confirming/canceling via text message
@@ -720,14 +757,28 @@ class RouterOrchestrator:
         else:
             # Dynamic confirmation prompt
             wf_name = matched.get("workflowName", "")
-            collected_labels = [inp.get("label", inp["field"]) for inp in updated_inputs if inp.get("collected")]
-            prompt = self.gemini.generate_contextual_response(
-                f"All inputs for '{wf_name}' are collected. Ask the user to confirm execution.",
-                {
-                    "workflow_name": wf_name,
-                    "collected_inputs": collected_labels,
-                },
-            )
+            
+            # Check if workflow has zero inputs (API-only workflows)
+            if not updated_inputs or len(updated_inputs) == 0:
+                prompt = self.gemini.generate_contextual_response(
+                    f"Workflow '{wf_name}' is ready to run. Ask user to confirm execution.",
+                    {"workflow_name": wf_name, "has_inputs": False},
+                )
+            else:
+                collected_data = {
+                    inp.get("label", inp["field"]): self._format_value_for_display(
+                        inp.get("value"), inp.get("type", "str")
+                    )
+                    for inp in updated_inputs if inp.get("collected")
+                }
+                prompt = self.gemini.generate_contextual_response(
+                    f"All inputs for '{wf_name}' are collected. Show what was collected and ask user to confirm execution.",
+                    {
+                        "workflow_name": wf_name,
+                        "collected_data": collected_data,
+                        "has_inputs": True,
+                    },
+                )
             await self.sessions.add_message(session_id, "assistant", prompt)
             await self.sessions.update_workflow_status(session_id, "ready_to_execute")
             
@@ -801,14 +852,28 @@ class RouterOrchestrator:
         if not missing:
             # All inputs collected - dynamic confirmation
             wf_name = workflow.get("workflowName", "")
-            collected_labels = [inp.get("label", inp["field"]) for inp in required_inputs if inp.get("collected")]
-            prompt = self.gemini.generate_contextual_response(
-                f"All inputs for '{wf_name}' are collected. Ask the user to confirm execution.",
-                {
-                    "workflow_name": wf_name,
-                    "collected_inputs": collected_labels,
-                },
-            )
+            
+            # Check if workflow has zero inputs
+            if not required_inputs or len(required_inputs) == 0:
+                prompt = self.gemini.generate_contextual_response(
+                    f"Workflow '{wf_name}' is ready to run. Ask user to confirm execution.",
+                    {"workflow_name": wf_name, "has_inputs": False},
+                )
+            else:
+                collected_data = {
+                    inp.get("label", inp["field"]): self._format_value_for_display(
+                        inp.get("value"), inp.get("type", "str")
+                    )
+                    for inp in required_inputs if inp.get("collected")
+                }
+                prompt = self.gemini.generate_contextual_response(
+                    f"All inputs for '{wf_name}' are collected. Show what was collected and ask user to confirm execution.",
+                    {
+                        "workflow_name": wf_name,
+                        "collected_data": collected_data,
+                        "has_inputs": True,
+                    },
+                )
             await self.sessions.add_message(session_id, "assistant", prompt)
             await self.sessions.update_workflow_status(session_id, "ready_to_execute")
             
@@ -898,14 +963,28 @@ class RouterOrchestrator:
         else:
             # Dynamic confirmation prompt
             wf_name = workflow.get("workflowName", "")
-            collected_labels = [inp.get("label", inp["field"]) for inp in updated_inputs if inp.get("collected")]
-            prompt = self.gemini.generate_contextual_response(
-                f"All inputs for '{wf_name}' are collected. Ask the user to confirm execution.",
-                {
-                    "workflow_name": wf_name,
-                    "collected_inputs": collected_labels,
-                },
-            )
+            
+            # Check if workflow has zero inputs
+            if not updated_inputs or len(updated_inputs) == 0:
+                prompt = self.gemini.generate_contextual_response(
+                    f"Workflow '{wf_name}' is ready to run. Ask user to confirm execution.",
+                    {"workflow_name": wf_name, "has_inputs": False},
+                )
+            else:
+                collected_data = {
+                    inp.get("label", inp["field"]): self._format_value_for_display(
+                        inp.get("value"), inp.get("type", "str")
+                    )
+                    for inp in updated_inputs if inp.get("collected")
+                }
+                prompt = self.gemini.generate_contextual_response(
+                    f"All inputs for '{wf_name}' are collected. Show what was collected and ask user to confirm execution.",
+                    {
+                        "workflow_name": wf_name,
+                        "collected_data": collected_data,
+                        "has_inputs": True,
+                    },
+                )
             await self.sessions.add_message(session_id, "assistant", prompt)
             await self.sessions.update_workflow_status(session_id, "ready_to_execute")
             

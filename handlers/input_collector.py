@@ -16,6 +16,8 @@ class InputCollector:
         """
         Parse required inputs from workflowSchema.call0.
         Handles both new format (body_data) and legacy format.
+        
+        Returns empty list for API-only workflows (MMM, etc.) that have no input requirements.
         """
         schema = workflow.get("workflowSchema", {})
         call0 = schema.get("call0", {})
