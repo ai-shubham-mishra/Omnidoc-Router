@@ -438,7 +438,7 @@ class RouterOrchestrator:
             await self.sessions.add_message(session_id, "user", message)
 
         request_data = self.builder.build_confirmation_request(
-            workflow, run_id, workflow_id, is_confirmed, confirmation_data, jwt_token,
+            workflow, run_id, workflow_id, is_confirmed, confirmation_data, jwt_token, session_id,
         )
 
         url = f"{AGENTICAPI_BASE_URL}{request_data['endpoint']}"
@@ -1085,7 +1085,7 @@ class RouterOrchestrator:
 
         # Build request
         request_data = self.builder.build_workflow_request(
-            workflow, collected_inputs, required_inputs, run_id, jwt_token,
+            workflow, collected_inputs, required_inputs, run_id, jwt_token, session_id,
         )
 
         endpoint = request_data["endpoint"]

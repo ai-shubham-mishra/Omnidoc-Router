@@ -19,6 +19,7 @@ class RequestBuilder:
         required_inputs: list,  # Added to get endpoint_field_name mapping
         run_id: str,
         jwt_token: str,
+        session_id: str = None,
     ) -> Dict[str, Any]:
         """
         Build initial workflow request (call0) based on body_type.
@@ -28,7 +29,7 @@ class RequestBuilder:
                 "endpoint": "/private-po-registration",
                 "content_type": "application/json" | "multipart/form-data",
                 "data": {...},
-                "headers": {"Authorization": "Bearer ..."},
+                "headers": {"Authorization": "Bearer ...", "X-Session-Id": "..."},
                 "has_files": bool,
                 "file_fields": {field_name: {"paths": [file_paths], "endpoint_name": "files"}}
             }
@@ -50,6 +51,10 @@ class RequestBuilder:
         file_type_fields = {inp["field"] for inp in required_inputs if inp.get("type") == "file"}
 
         headers = {"Authorization": jwt_token}
+        
+        # Add session_id to headers if provided
+        if session_id:
+            headers["X-Session-Id"] = session_id
 
         file_fields = {}
         data_fields = {}
@@ -104,6 +109,7 @@ class RequestBuilder:
         is_confirmed: bool,
         confirmation_data: Dict[str, Any],
         jwt_token: str,
+        session_id: str = None,
     ) -> Dict[str, Any]:
         """
         Build HITL confirmation request (call1) using workflow schema.
@@ -163,12 +169,18 @@ class RequestBuilder:
         
         logger.info(f"🔧 HITL confirmation request built: {list(payload.keys())}")
         
+        headers = {
+            "Authorization": jwt_token,
+            "Content-Type": "application/json",
+        }
+        
+        # Add session_id to headers if provided
+        if session_id:
+            headers["X-Session-Id"] = session_id
+        
         return {
             "endpoint": endpoint,
             "content_type": "application/json",
             "data": payload,
-            "headers": {
-                "Authorization": jwt_token,
-                "Content-Type": "application/json",
-            },
+            "headers": headers,
         }
