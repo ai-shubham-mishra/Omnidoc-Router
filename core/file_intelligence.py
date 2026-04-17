@@ -70,7 +70,7 @@ Size: {size_bytes} bytes
 IMPORTANT: Return ONLY valid JSON, no markdown, no explanation.
 Return format:
 {{
-  "document_type": "<type such as: purchase_order, invoice, business_card, resume, contract, receipt, report, spreadsheet, image, presentation, letter, form, id_document, certificate, unknown>",
+  "document_type": "<type such as: purchase_order, pricesheet, json_data, invoice, business_card, resume, contract, receipt, report, spreadsheet, image, presentation, letter, form, id_document, certificate, unknown>",
   "summary": "<1-sentence description of what this file likely contains>",
   "keywords": ["<keyword1>", "<keyword2>", "<keyword3>"],
   "confidence": <0.0-1.0>
@@ -117,6 +117,13 @@ Return format:
                 "keywords": ["purchase_order", "po", "procurement"],
                 "confidence": 0.7,
             }
+        elif any(kw in filename_lower for kw in ["price", "pricesheet", "pricing", "pricelist"]):
+            return {
+                "document_type": "pricesheet",
+                "summary": f"Pricesheet or pricing document: {filename}",
+                "keywords": ["pricesheet", "pricing", "price", "json"],
+                "confidence": 0.8,
+            }
         elif any(kw in filename_lower for kw in ["invoice", "bill", "receipt"]):
             return {
                 "document_type": "invoice",
@@ -136,6 +143,13 @@ Return format:
                 "document_type": "image",
                 "summary": f"Image file: {filename}",
                 "keywords": ["image"],
+                "confidence": 0.8,
+            }
+        elif mime_type == "application/json" or filename_lower.endswith(".json"):
+            return {
+                "document_type": "json_data",
+                "summary": f"JSON data file: {filename}",
+                "keywords": ["json", "data", "pricesheet" if "price" in filename_lower else "config"],
                 "confidence": 0.8,
             }
         elif "spreadsheet" in mime_type or filename_lower.endswith((".xlsx", ".xls", ".csv")):
@@ -183,7 +197,9 @@ Return format:
 
         # 1. Document type matches workflow/input name
         type_matches = {
-            "purchase_order": ["po", "purchase", "order", "procurement"],
+            "purchase_order": ["po", "purchase", "order", "procurement", "document"],
+            "pricesheet": ["price", "pricesheet", "pricing", "pricelist", "json"],
+            "json_data": ["json", "data", "price", "pricesheet", "config"],
             "invoice": ["invoice", "billing", "payment"],
             "business_card": ["business card", "contact", "lead", "hubspot", "crm"],
             "resume": ["resume", "cv", "candidate", "recruitment", "hiring"],

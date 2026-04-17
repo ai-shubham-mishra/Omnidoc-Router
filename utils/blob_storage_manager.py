@@ -47,7 +47,7 @@ class BlobStorageManager:
         self.container_name = get_secret("AZ_BLOB_CONTAINER_NAME", default=os.getenv("AZ_BLOB_CONTAINER_NAME", "knowledge-base"))
         self.account_name = get_secret("AZ_BLOB_STORAGE_ACCOUNT_NAME", default=os.getenv("AZ_BLOB_STORAGE_ACCOUNT_NAME", "omnidocdev"))
         self.account_key = get_secret("AZ_BLOB_CONN_KEY", default=os.getenv("AZ_BLOB_CONN_KEY"))
-        self.base_directory = os.getenv("AZ_BLOB_BASE_DIRECTORY", "knowledge_base")
+        self.base_directory = os.getenv("AZ_BLOB_BASE_DIRECTORY", "")  # No prefix
 
         if not self.connection_string:
             raise ValueError("AZ_BLOB_CONN_STRING not found in Key Vault or environment variables")

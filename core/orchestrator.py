@@ -183,8 +183,9 @@ class RouterOrchestrator:
 
         # 4b. Immediately match newly uploaded files to active workflow inputs
         #     Runs BEFORE any intent routing so files are matched regardless.
-        if current_wf.get("workflow_id") and wf_status in ("collecting", "ready_to_execute"):
-            await self._recheck_all_inputs(session_id, session)
+        #     IMPORTANT: Only assign newly uploaded files (all_file_ids), not all session file_ids
+        if current_wf.get("workflow_id") and wf_status in ("collecting", "ready_to_execute") and all_file_ids:
+            await self._recheck_all_inputs(session_id, session, new_file_ids=all_file_ids)
             session = await self.sessions.get_session(session_id)
             current_wf = session.get("current_workflow", {})
             wf_status = current_wf.get("status", "idle")
@@ -350,7 +351,7 @@ class RouterOrchestrator:
         # 6. Handle idle or collecting states
         if wf_status == "idle":
             # No active workflow - match new intent
-            return await self._identify_workflow_v2(session_id, message, org_id, files_uploaded)
+            return await self._identify_workflow_v2(session_id, message, user_id, org_id, files_uploaded)
 
         elif wf_status in ("collecting", "ready_to_execute"):
             # Continue collecting or execute if ready
@@ -625,6 +626,7 @@ class RouterOrchestrator:
         self,
         session_id: str,
         message: str,
+        user_id: str,
         org_id: str,
         files_uploaded: List,
     ) -> RouterResponse:
@@ -683,7 +685,7 @@ class RouterOrchestrator:
         required_inputs = self.collector.parse_workflow_inputs(matched)
         required_inputs = self.collector.auto_fill_inputs(
             required_inputs,
-            {"user_id": "", "org_id": ""},
+            {"user_id": user_id, "org_id": org_id},
         )
 
         await self.sessions.set_workflow_context(session_id, matched, required_inputs)
@@ -1265,39 +1267,156 @@ class RouterOrchestrator:
         """Delete a session (only if it belongs to the user)."""
         return await self.sessions.delete_session(session_id, user_id)
 
-    async def _recheck_all_inputs(self, session_id: str, session: Dict[str, Any]):
+    async def _recheck_all_inputs(
+        self, 
+        session_id: str, 
+        session: Dict[str, Any],
+        new_file_ids: Optional[List[str]] = None
+    ):
         """
-        Auto-collect file inputs using file_ids from session (new file_id architecture).
-        Called after file upload to immediately satisfy file input requirements.
-        File_ids are lightweight references - actual files downloaded via middleware during execution.
+        INTELLIGENT file input matching using FileIntelligence classification.
+        Called after file upload to intelligently match files to workflow inputs.
+        
+        Smart Assignment Logic:
+        1. Get file metadata with classification (document_type, keywords)
+        2. Score each file against each uncollected input using FileIntelligence
+        3. Assign best matches only if score exceeds threshold
+        4. Prevents assigning same file to multiple inputs
+        5. Allows reusing session files if they're good matches
+        
+        Args:
+            session_id: Session ID
+            session: Session data
+            new_file_ids: Specific file_ids to prioritize (newly uploaded)
         """
         current_wf = session.get("current_workflow", {})
         if not current_wf.get("workflow_id"):
             return
 
         required_inputs = current_wf.get("required_inputs", [])
-        file_ids = session.get("file_ids", [])
+        workflow_name = current_wf.get("workflow_name", "")
         
-        if not file_ids:
-            return  # No files available to auto-collect
+        # Get uncollected file-type inputs
+        uncollected_file_inputs = [
+            inp for inp in required_inputs
+            if inp.get("type") in ("file", "files") and not inp.get("collected")
+        ]
+        
+        if not uncollected_file_inputs:
+            return  # All file inputs already collected
+        
+        # Get all available file_ids from session (not just new ones)
+        # This allows reusing files across workflows if they match
+        all_file_ids = session.get("file_ids", [])
+        if not all_file_ids:
+            return
+        
+        # Fetch file metadata from file middleware for classification
+        # Filter to only files that exist and are accessible
+        file_metadata_list = []
+        for fid in all_file_ids:
+            file_meta = self.file_middleware.files_collection.find_one({"_id": fid})
+            if file_meta:
+                # Classify file if not already classified
+                if "classification" not in file_meta:
+                    classification = self.file_intel.classify_file({
+                        "original_name": file_meta.get("original_name", ""),
+                        "mime_type": file_meta.get("mime_type", ""),
+                        "size_bytes": file_meta.get("size_bytes", 0),
+                    })
+                    # Store classification in MongoDB for future use
+                    self.file_middleware.files_collection.update_one(
+                        {"_id": fid},
+                        {"$set": {"classification": classification}}
+                    )
+                    file_meta["classification"] = classification
+                
+                file_metadata_list.append(file_meta)
+        
+        if not file_metadata_list:
+            return  # No file metadata available
+        
+        # Track which file_ids are already assigned to THIS workflow's inputs
+        already_assigned = set()
+        for inp in required_inputs:
+            if inp.get("collected"):
+                value = inp.get("value")
+                if isinstance(value, list):
+                    already_assigned.update(value)
+                elif value:
+                    already_assigned.add(value)
         
         matched_any = False
-
-        # Auto-assign file_ids to uncollected file-type inputs
-        for inp in required_inputs:
-            if inp.get("type") in ("file", "files") and not inp.get("collected"):
-                # IMPORTANT: Always store as LIST for consistency with request_builder expectations
-                # Single file input: list with one file_id ["abc-123"]
-                # Multi-file input: list with all file_ids ["abc-123", "def-456"]
-                file_value = [file_ids[0]] if inp.get("type") == "file" else file_ids
+        
+        # Match each uncollected input to best available file
+        for inp in uncollected_file_inputs:
+            input_type = inp.get("type")
+            
+            if input_type == "file":
+                # Single file input: Find best match
+                best_file = None
+                best_score = 0.0
                 
-                await self.sessions.mark_input_collected(
-                    session_id, inp["field"], file_value
-                )
-                matched_any = True
-                logger.info(
-                    f"✅ Auto-collected '{inp.get('label', inp['field'])}' with {len(file_value)} file_id(s)"
-                )
+                for file_meta in file_metadata_list:
+                    fid = file_meta["file_id"]
+                    if fid in already_assigned:
+                        continue  # Skip already assigned files
+                    
+                    score = self.file_intel.match_file_to_input(
+                        file_meta,
+                        inp,
+                        workflow_name
+                    )
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_file = file_meta
+                
+                # Only auto-assign if score is above threshold (4.0 = confident match)
+                threshold = 4.0
+                if best_file and best_score >= threshold:
+                    file_value = [best_file["file_id"]]
+                    await self.sessions.mark_input_collected(
+                        session_id, inp["field"], file_value
+                    )
+                    already_assigned.add(best_file["file_id"])
+                    matched_any = True
+                    logger.info(
+                        f"✅ Auto-collected '{inp.get('label', inp['field'])}' with file '{best_file['original_name']}' "
+                        f"(score: {best_score:.1f}, type: {best_file.get('classification', {}).get('document_type', 'unknown')})"
+                    )
+                else:
+                    logger.info(
+                        f"⏸️ No confident match for '{inp.get('label', inp['field'])}' "
+                        f"(best score: {best_score:.1f} < threshold: {threshold})"
+                    )
+            
+            elif input_type == "files":
+                # Multi-file input: Collect all unassigned files with positive scores
+                matched_files = []
+                for file_meta in file_metadata_list:
+                    fid = file_meta["file_id"]
+                    if fid in already_assigned:
+                        continue
+                    
+                    score = self.file_intel.match_file_to_input(
+                        file_meta,
+                        inp,
+                        workflow_name
+                    )
+                    
+                    if score >= 2.0:  # Lower threshold for multi-file inputs
+                        matched_files.append(fid)
+                        already_assigned.add(fid)
+                
+                if matched_files:
+                    await self.sessions.mark_input_collected(
+                        session_id, inp["field"], matched_files
+                    )
+                    matched_any = True
+                    logger.info(
+                        f"✅ Auto-collected '{inp.get('label', inp['field'])}' with {len(matched_files)} file(s)"
+                    )
 
         # Auto-transition to ready_to_execute if all inputs now collected
         if matched_any:

@@ -107,7 +107,7 @@ jobs:
                   "AZ_COSMOS_DB_CHAT_SESSIONS_COLLECTION=chat_sessions" \
                   "SESSION_TTL_SECONDS=259200" \
                   "STORAGE_BACKEND=azure" \
-                  "AZ_BLOB_BASE_DIRECTORY=knowledge_base" \
+                  "AZ_BLOB_BASE_DIRECTORY=" \
                   "AZ_BLOB_CONTAINER_NAME=knowledge-base" \
                   "AZ_BLOB_STORAGE_ACCOUNT_NAME=omnidocdev"
               
@@ -154,7 +154,7 @@ jobs:
                 "AZ_COSMOS_DB_CHAT_SESSIONS_COLLECTION=chat_sessions" \
                 "SESSION_TTL_SECONDS=259200" \
                 "STORAGE_BACKEND=azure" \
-                "AZ_BLOB_BASE_DIRECTORY=knowledge_base" \
+                "AZ_BLOB_BASE_DIRECTORY=" \
                 "AZ_BLOB_CONTAINER_NAME=knowledge-base" \
                 "AZ_BLOB_STORAGE_ACCOUNT_NAME=omnidocdev"
             

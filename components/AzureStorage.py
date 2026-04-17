@@ -3,7 +3,7 @@ Azure Blob Storage Utilities for OmniDoc Router
 Self-contained storage operations - uses Router's own KeyVaultClient.
 
 Container: "knowledge-base" (with hyphen)
-Directory structure inside container: knowledge_base/{org_id}/{user_id}/{session_id}/{run_id}/{stage}/
+Directory structure inside container: {org_id}/{user_id}/{session_id}/{run_id}/{stage}/
 Valid stages: input, intermediate, output
 
 Local tmp structure: tmp/{session_id}/{run_id}/ or tmp/{run_id}/ if session_id not provided
@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 # ============== Configuration ==============
 CONTAINER_NAME = get_secret("AZ_BLOB_CONTAINER_NAME", "knowledge-base")  # with hyphen
-BASE_DIRECTORY = "knowledge_base"  # with underscore - directory inside container
+BASE_DIRECTORY = ""  # No prefix - files stored at container root
 VALID_STAGES = ("input", "intermediate", "output")
 
 # Azure credentials
@@ -82,27 +82,28 @@ def _build_blob_path(
     Build hierarchical blob path.
     
     Two patterns:
-    1. Session-level files (no run_id): knowledge_base/{org}/{user}/{session}/{file}
-    2. Workflow files (with run_id): knowledge_base/{org}/{user}/{session}/{run}/{stage}/{file}
+    1. Session-level files (no run_id): {org}/{user}/{session}/{file}
+    2. Workflow files (with run_id): {org}/{user}/{session}/{run}/{stage}/{file}
     """
     file_id = str(uuid.uuid4())[:8]
     safe_name = _sanitize(filename)
     
     # Pattern 1: Session-level files (router uploads)
     if not run_id or not stage:
-        return "/".join([
+        path_parts = [
             BASE_DIRECTORY,
             org_id or "unknown_org",
             user_id or "unknown_user",
             session_id or "no_session",
             f"{file_id}_{safe_name}",
-        ])
+        ]
+        return "/".join(filter(None, path_parts))
     
     # Pattern 2: Workflow files (with run_id and stage)
     if stage not in VALID_STAGES:
         raise ValueError(f"Invalid stage '{stage}'. Must be one of: {VALID_STAGES}")
     
-    return "/".join([
+    path_parts = [
         BASE_DIRECTORY,
         org_id or "unknown_org",
         user_id or "unknown_user",
@@ -110,7 +111,8 @@ def _build_blob_path(
         run_id,
         stage,
         f"{file_id}_{safe_name}",
-    ])
+    ]
+    return "/".join(filter(None, path_parts))
 
 
 def get_tmp_path(run_id: str, session_id: str = None, filename: str = None) -> str:
@@ -157,7 +159,7 @@ def upload_file_to_blob(
     
     Returns:
         {
-            "blob_path": "knowledge_base/org/user/...",
+            "blob_path": "org/user/session/run/stage/file",
             "sas_url": "https://...",
             "local_tmp_path": "tmp/session/run/file.pdf",
             "file_id": "abc123",
@@ -321,7 +323,7 @@ def download_from_sas_url(
     try:
         # Extract filename from URL if not provided
         if not filename:
-            # Parse URL path: .../knowledge_base/org/user/session/run/stage/abc123_file.pdf?sas_token
+            # Parse URL path: .../org/user/session/run/stage/abc123_file.pdf?sas_token
             url_path = sas_url.split('?')[0]  # Remove SAS token
             filename = url_path.split('/')[-1]
             # Remove file_id prefix

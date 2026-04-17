@@ -13,7 +13,7 @@ SESSION_TTL_SECONDS = 259200  # 3 days
 STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "azure")
 
 # Hierarchical blob base directory
-AZ_BLOB_BASE_DIRECTORY = os.getenv("AZ_BLOB_BASE_DIRECTORY", "knowledge_base")
+AZ_BLOB_BASE_DIRECTORY = os.getenv("AZ_BLOB_BASE_DIRECTORY", "")  # No prefix
 
 # Note: Azure Blob credentials are fetched directly by BlobStorageManager
 # from Azure Key Vault using components/KeyVaultClient.py
