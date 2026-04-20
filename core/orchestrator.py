@@ -12,6 +12,7 @@ Pinecone Integration:
 import os
 import uuid
 import logging
+import asyncio
 import httpx
 from typing import Dict, Any, Optional, List
 
@@ -1243,6 +1244,9 @@ class RouterOrchestrator:
         await self.sessions.complete_workflow(
             session_id, result, status="completed", result_summary=result_summary
         )
+        
+        # Small delay before second Gemini call to help with rate limits
+        await asyncio.sleep(0.5)
         
         summary = self.gemini.format_final_result(result, workflow_name)
         await self.sessions.add_message(session_id, "assistant", summary)
