@@ -54,7 +54,7 @@ class FileIntelligence:
     Classifies files, matches them to workflow inputs, and tracks ownership.
     """
 
-    def __init__(self, model_name: str = "gemini-2.0-flash"):
+    def __init__(self, model_name: str = "gemini-3-flash-preview"):
         self.model = genai.GenerativeModel(
             model_name=model_name,
             generation_config=genai.GenerationConfig(

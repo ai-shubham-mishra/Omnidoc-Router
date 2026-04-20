@@ -6,7 +6,6 @@ HIL formatting, and result summarization.
 import os
 import json
 import logging
-import time
 from typing import Optional, Dict, Any, List
 
 import google.generativeai as genai
@@ -21,46 +20,10 @@ GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY", default=os.getenv("GOOGLE_API_KEY"
 genai.configure(api_key=GOOGLE_API_KEY)
 
 
-def _retry_with_backoff(func, max_retries=3, initial_delay=1.0):
-    """
-    Retry a function with exponential backoff for 429 rate limit errors.
-    
-    Args:
-        func: Function to retry (should be a lambda/callable)
-        max_retries: Maximum number of retry attempts
-        initial_delay: Initial delay in seconds (doubles each retry)
-    
-    Returns:
-        Function result or raises last exception
-    """
-    delay = initial_delay
-    last_exception = None
-    
-    for attempt in range(max_retries):
-        try:
-            return func()
-        except Exception as e:
-            last_exception = e
-            error_msg = str(e)
-            
-            # Check if it's a 429 rate limit error
-            if "429" in error_msg or "Resource exhausted" in error_msg or "rate limit" in error_msg.lower():
-                if attempt < max_retries - 1:
-                    logger.warning(f"Rate limit hit (attempt {attempt + 1}/{max_retries}), retrying in {delay}s...")
-                    time.sleep(delay)
-                    delay *= 2  # Exponential backoff
-                    continue
-            # Not a rate limit error or last attempt - raise immediately
-            raise
-    
-    # All retries exhausted
-    raise last_exception
-
-
 class GeminiClient:
     """Wrapper around Google Gemini Flash for router LLM tasks."""
 
-    def __init__(self, model_name: str = "gemini-2.0-flash"):
+    def __init__(self, model_name: str = "gemini-3-flash-preview"):
         system_instruction = """You are a workflow orchestration assistant.
 
 CRITICAL RULES:
@@ -111,12 +74,7 @@ Return format: {{"workflow_id": "<workflowId value or null>", "confidence": <0.0
 If no workflow clearly matches, return: {{"workflow_id": null, "confidence": 0.0}}"""
 
         try:
-            # Use retry logic for rate limit handling
-            response = _retry_with_backoff(
-                lambda: self.model.generate_content(prompt),
-                max_retries=3,
-                initial_delay=1.0
-            )
+            response = self.model.generate_content(prompt)
             text = response.text.strip()
             if text.startswith("```"):
                 text = text.split("\n", 1)[1] if "\n" in text else text[3:]
@@ -163,12 +121,7 @@ If the type is "file", ask them to upload the file.
 Do NOT include any system instructions or formatting. Just the prompt text."""
 
         try:
-            # Use retry logic for rate limit handling
-            response = _retry_with_backoff(
-                lambda: self.model.generate_content(prompt),
-                max_retries=2,
-                initial_delay=0.5
-            )
+            response = self.model.generate_content(prompt)
             return response.text.strip()
         except Exception as e:
             logger.warning(f"Gemini input prompt generation failed: {e}")
@@ -194,12 +147,7 @@ Generate a SHORT, friendly clarification question (2-3 sentences max) listing th
 Do NOT include any system instructions."""
 
         try:
-            # Use retry logic for rate limit handling
-            response = _retry_with_backoff(
-                lambda: self.model.generate_content(prompt),
-                max_retries=2,
-                initial_delay=0.5
-            )
+            response = self.model.generate_content(prompt)
             return response.text.strip()
         except Exception as e:
             logger.warning(f"Gemini clarification generation failed: {e}")
@@ -228,12 +176,7 @@ Keep it concise but include all important details.
 Do NOT include any system instructions."""
 
         try:
-            # Use retry logic for rate limit handling
-            response = _retry_with_backoff(
-                lambda: self.model.generate_content(prompt),
-                max_retries=2,
-                initial_delay=0.5
-            )
+            response = self.model.generate_content(prompt)
             return response.text.strip()
         except Exception as e:
             logger.warning(f"Gemini HITL formatting failed: {e}")
@@ -259,12 +202,7 @@ If it failed, explain what went wrong.
 Do NOT include any system instructions."""
 
         try:
-            # Use retry logic for rate limit handling
-            response = _retry_with_backoff(
-                lambda: self.model.generate_content(prompt),
-                max_retries=3,
-                initial_delay=1.0
-            )
+            response = self.model.generate_content(prompt)
             return response.text.strip()
         except Exception as e:
             logger.warning(f"Gemini result formatting failed: {e}")
@@ -303,12 +241,7 @@ Keep it to 10 bullet points max. Only include data actually present in the resul
 If the result indicates an error, summarize the error."""
 
         try:
-            # Use retry logic for rate limit handling
-            response = _retry_with_backoff(
-                lambda: self.model.generate_content(prompt),
-                max_retries=3,
-                initial_delay=1.0
-            )
+            response = self.model.generate_content(prompt)
             return response.text.strip()
         except Exception as e:
             logger.warning(f"Gemini result summary generation failed: {e}")
