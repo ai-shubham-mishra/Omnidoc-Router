@@ -41,6 +41,7 @@ class InputCollector:
                     "type": input_spec.get("inputType", "str"),
                     "size": input_spec.get("inputSize", 1),
                     "endpoint_field_name": endpoint_field_name,  # Use from schema or default to field name
+                    "file_type": input_spec.get("fileType"),  # ✨ Extract fileType for MIME validation
                     "collected": False,
                     "auto_extracted": False,
                     "value": None,

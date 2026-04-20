@@ -24,6 +24,29 @@ logger = logging.getLogger(__name__)
 GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY", default=os.getenv("GOOGLE_API_KEY"))
 genai.configure(api_key=GOOGLE_API_KEY)
 
+# File type to MIME type mapping for fileType validation
+FILE_TYPE_MIME_MAP = {
+    "json": ["application/json"],
+    "pdf": ["application/pdf"],
+    "csv": ["text/csv", "application/csv"],
+    "document": [
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # .docx
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",        # .xlsx
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation", # .pptx
+        "application/msword",  # .doc
+        "application/vnd.ms-excel",  # .xls
+        "application/vnd.ms-powerpoint",  # .ppt
+    ],
+    "image": [
+        "image/jpeg", "image/jpg", "image/png", 
+        "image/gif", "image/webp", "image/bmp"
+    ],
+    "email": ["message/rfc822", "application/vnd.ms-outlook"],
+    "text": ["text/plain"],
+    "xml": ["application/xml", "text/xml"],
+    "any": ["*"]  # Wildcard - accepts all file types
+}
+
 
 class FileIntelligence:
     """
@@ -170,6 +193,46 @@ Return format:
 
     # ==================== Phase 3: Smart File Matching ====================
 
+    def _validate_mime_type(
+        self, 
+        file_info: Dict[str, Any], 
+        expected_file_type: str
+    ) -> bool:
+        """
+        Validate if file's MIME type matches expected fileType.
+        
+        Args:
+            file_info: File metadata with mime_type
+            expected_file_type: Expected file type from workflow schema (e.g., "json", "pdf")
+            
+        Returns:
+            True if valid match, False if mismatch
+        """
+        actual_mime = file_info.get("mime_type", "").lower()
+        expected_mimes = FILE_TYPE_MIME_MAP.get(expected_file_type, [])
+        
+        if not expected_mimes:
+            # Unrecognized file type - log warning and allow
+            logger.warning(f"Unrecognized fileType '{expected_file_type}', treating as 'any'")
+            return True
+        
+        # Wildcard check
+        if "*" in expected_mimes:
+            return True
+        
+        # Exact match check
+        if actual_mime in expected_mimes:
+            return True
+        
+        # Partial match for generic MIME types (e.g., "image/*" matches "image/png")
+        for expected_mime in expected_mimes:
+            if expected_mime.endswith("/*"):
+                mime_category = expected_mime.replace("/*", "")
+                if actual_mime.startswith(mime_category + "/"):
+                    return True
+        
+        return False
+
     def match_file_to_input(
         self,
         file_info: Dict[str, Any],
@@ -178,15 +241,29 @@ Return format:
     ) -> float:
         """
         Score how well a file matches a specific workflow input.
+        Now includes MIME type validation as a hard requirement.
 
         Args:
-            file_info: File metadata including classification
-            input_spec: Workflow input spec (field, type, label)
+            file_info: File metadata including classification and mime_type
+            input_spec: Workflow input spec (field, type, label, file_type)
             workflow_name: Name of the target workflow
 
         Returns:
-            Score from 0.0 to 10.0 (higher = better match)
+            Score from -100.0 to 10.0 (higher = better match, -100 = hard rejected)
         """
+        # ✨ TIER 0: MIME Type Hard Validation (NEW)
+        expected_file_type = input_spec.get("file_type")
+        if expected_file_type and expected_file_type != "any":
+            if not self._validate_mime_type(file_info, expected_file_type):
+                # HARD BLOCK - MIME type mismatch
+                logger.info(
+                    f"❌ MIME type mismatch: '{file_info.get('original_name')}' "
+                    f"(type: {file_info.get('mime_type')}) rejected for input '{input_spec.get('label')}' "
+                    f"(expects: {expected_file_type})"
+                )
+                return -100.0
+        
+        # Continue with existing scoring logic
         score = 0.0
         classification = file_info.get("classification", {})
         doc_type = classification.get("document_type", "unknown")
