@@ -17,7 +17,7 @@ from typing import Dict, Any, Optional, List
 
 from dotenv import load_dotenv
 
-from core.gemini_client import GeminiClient
+from core.azure_openai_client import AzureOpenAIClient
 from core.session_manager import SessionManager
 from core.workflow_matcher import WorkflowMatcher
 from core.file_intelligence import FileIntelligence
@@ -56,7 +56,7 @@ class RouterOrchestrator:
     """
 
     def __init__(self):
-        self.gemini = GeminiClient()
+        self.gemini = AzureOpenAIClient()
         self.sessions = SessionManager()
         self.matcher = WorkflowMatcher()
         self.collector = InputCollector()

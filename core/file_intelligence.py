@@ -14,15 +14,16 @@ import time
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 
-import google.generativeai as genai
+from openai import AzureOpenAI
 from dotenv import load_dotenv
 from components.KeyVaultClient import get_secret
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY", default=os.getenv("GOOGLE_API_KEY"))
-genai.configure(api_key=GOOGLE_API_KEY)
+# Get Azure OpenAI configuration from Key Vault
+AZURE_OPENAI_ENDPOINT = get_secret("AZURE_OPENAI_ENDPOINT", default=os.getenv("AZURE_OPENAI_ENDPOINT"))
+AZURE_OPENAI_KEY = get_secret("AZURE_OPENAI_KEY", default=os.getenv("AZURE_OPENAI_KEY"))
 
 # File type to MIME type mapping for fileType validation
 FILE_TYPE_MIME_MAP = {
@@ -54,13 +55,18 @@ class FileIntelligence:
     Classifies files, matches them to workflow inputs, and tracks ownership.
     """
 
-    def __init__(self, model_name: str = "gemini-3-flash-preview"):
-        self.model = genai.GenerativeModel(
-            model_name=model_name,
-            generation_config=genai.GenerationConfig(
-                temperature=0.2,
-                max_output_tokens=1024,
-            ),
+    def __init__(self, deployment: str = "gpt-4o", api_version: str = "2024-12-01-preview"):
+        self.deployment = deployment
+        self.api_version = api_version
+        
+        if not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_KEY:
+            logger.error("Azure OpenAI credentials not found in Key Vault or .env")
+            raise ValueError("AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY must be configured")
+        
+        self.client = AzureOpenAI(
+            azure_endpoint=AZURE_OPENAI_ENDPOINT,
+            api_key=AZURE_OPENAI_KEY,
+            api_version=self.api_version,
         )
 
     # ==================== Phase 2: File Classification ====================
@@ -99,14 +105,17 @@ Return format:
   "confidence": <0.0-1.0>
 }}"""
 
-                response = self.model.generate_content(prompt)
-                text = response.text.strip()
-                if text.startswith("```"):
-                    text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-                if text.endswith("```"):
-                    text = text[:-3]
-                text = text.strip()
-
+                response = self.client.chat.completions.create(
+                    model=self.deployment,
+                    messages=[
+                        {"role": "system", "content": "You are a document classification assistant. Always respond with valid JSON."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.2,
+                    max_tokens=512,
+                )
+                text = response.choices[0].message.content.strip()
                 classification = json.loads(text)
                 logger.info(
                     f"Classified '{original_name}' as '{classification.get('document_type')}' "
@@ -575,8 +584,16 @@ Rules:
 - Do NOT suggest re-running a workflow to answer a question about past results"""
 
         try:
-            response = self.model.generate_content(prompt)
-            return response.text.strip()
+            response = self.client.chat.completions.create(
+                model=self.deployment,
+                messages=[
+                    {"role": "system", "content": "You are a helpful workflow assistant."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=512,
+            )
+            return response.choices[0].message.content.strip()
         except Exception as e:
             logger.warning(f"Session question answering failed: {e}")
             return "I'm sorry, I couldn't process your question. Could you try rephrasing?"

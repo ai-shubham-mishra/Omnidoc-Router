@@ -19,8 +19,8 @@ pymongo
 redis[hiredis]
 aioredis
 
-# Google Gemini
-google-generativeai
+# Azure OpenAI (replacing Gemini)
+openai>=1.0.0
 
 # JWT authentication
 PyJWT
@@ -41,3 +41,4 @@ tiktoken
 # Text extraction from files
 PyPDF2
 python-docx
+openai
