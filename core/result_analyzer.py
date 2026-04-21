@@ -124,7 +124,7 @@ class ResultAnalyzer:
         # Extract all components of the response
         status = result.get("status", "unknown")
         message = result.get("message", "")
-        data = result.get("data", {}) or result.get("analytics_data", {})
+        data = result.get("data", {}) or result.get("analytics_data", {}) or result.get("body", {})
         file_outputs = result.get("file_outputs", [])
         
         # SECURITY: Sanitize sensitive fields before LLM analysis
@@ -250,8 +250,15 @@ FULL WORKFLOW RESPONSE:
 INSTRUCTIONS:
 1. Read the data and metrics from the response.
 2. Extract key outcomes and interpret what they MEAN, not just echo values.
-   - Example: Instead of "Channel A: 1.2464", say "Channel A delivered 124% ROI"
    - Example: Instead of "Total: 50000", say "Generated $50,000 in revenue"
+   - **CRITICAL FOR ROAS/Marginal ROAS**: Present as decimal values rounded to 2 decimal places, NOT percentages
+     ✅ Correct: "Channel A ROAS: **1.25**" or "Channel A returned **1.25x** on ad spend"
+     ❌ Wrong: "Channel A ROAS: 125%" or "Channel A: 124.64%"
+   - **CRITICAL FOR WATERFALL/CONTRIBUTION PERCENTAGES**: The percentage field is ALREADY a percentage (0-100+ scale).
+     Do NOT multiply by 100. Round to 2 decimals WITHOUT the % symbol (the column header already indicates %).
+     ✅ Correct: If percentage value is 44.69955488804548, display as **44.70** (NOT 44.70% or 4,469.96%)
+     ✅ Correct: If percentage value is 4.640157566353377, display as **4.64** (NOT 4.64% or 464.02%)
+     ❌ Wrong: Adding % symbol, or multiplying by 100
 3. Choose the most natural format based on data complexity:
    - **Paragraph**: Simple results with 1-3 values
    - **Bullets**: List of 4-8 distinct findings or items
