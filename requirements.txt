@@ -42,3 +42,4 @@ tiktoken
 PyPDF2
 python-docx
 openai
+marko
