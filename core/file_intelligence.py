@@ -99,7 +99,7 @@ Size: {size_bytes} bytes
 IMPORTANT: Return ONLY valid JSON, no markdown, no explanation.
 Return format:
 {{
-  "document_type": "<type such as: purchase_order, pricesheet, json_data, invoice, business_card, resume, contract, receipt, report, spreadsheet, image, presentation, letter, form, id_document, certificate, unknown>",
+  "document_type": "<type such as: purchase_order, pricesheet, json_data, invoice, delivery_note, business_card, resume, contract, receipt, report, spreadsheet, image, presentation, letter, form, id_document, certificate, unknown>",
   "summary": "<1-sentence description of what this file likely contains>",
   "keywords": ["<keyword1>", "<keyword2>", "<keyword3>"],
   "confidence": <0.0-1.0>
@@ -156,11 +156,25 @@ Return format:
                 "keywords": ["pricesheet", "pricing", "price", "json"],
                 "confidence": 0.8,
             }
-        elif any(kw in filename_lower for kw in ["invoice", "bill", "receipt"]):
+        elif any(kw in filename_lower for kw in ["invoice", "bill"]):
             return {
                 "document_type": "invoice",
                 "summary": f"Invoice or billing document: {filename}",
                 "keywords": ["invoice", "billing"],
+                "confidence": 0.7,
+            }
+        elif any(kw in filename_lower for kw in ["delivery", "lieferschein", "shipping", "dispatch"]):
+            return {
+                "document_type": "delivery_note",
+                "summary": f"Delivery note or shipping document: {filename}",
+                "keywords": ["delivery", "note", "shipping"],
+                "confidence": 0.75,
+            }
+        elif any(kw in filename_lower for kw in ["receipt", "expense", "reimbursement"]):
+            return {
+                "document_type": "receipt",
+                "summary": f"Receipt or expense document: {filename}",
+                "keywords": ["receipt", "expense"],
                 "confidence": 0.7,
             }
         elif any(kw in filename_lower for kw in ["contract", "agreement"]):
@@ -286,11 +300,12 @@ Return format:
             "purchase_order": ["po", "purchase", "order", "procurement", "document"],
             "pricesheet": ["price", "pricesheet", "pricing", "pricelist", "json"],
             "json_data": ["json", "data", "price", "pricesheet", "config"],
-            "invoice": ["invoice", "billing", "payment"],
+            "invoice": ["invoice", "billing", "payment", "generation"],
+            "delivery_note": ["delivery", "note", "shipping", "dispatch", "lieferschein", "fulfillment"],
+            "receipt": ["receipt", "expense", "reimbursement"],
             "business_card": ["business card", "contact", "lead", "hubspot", "crm"],
             "resume": ["resume", "cv", "candidate", "recruitment", "hiring"],
             "contract": ["contract", "agreement", "legal"],
-            "receipt": ["receipt", "expense", "reimbursement"],
             "id_document": ["identity", "id", "verification", "kyc"],
             "certificate": ["certificate", "certification", "credential"],
         }
@@ -337,7 +352,7 @@ Return format:
         session_files: List[Dict[str, Any]],
         input_spec: Dict[str, Any],
         workflow_name: str,
-        auto_fill_threshold: float = 4.0,
+        auto_fill_threshold: float = 3.0,
     ) -> Optional[Dict[str, Any]]:
         """
         Find the best matching file from session for a workflow input.
@@ -347,7 +362,7 @@ Return format:
             session_files: All files in the session
             input_spec: The workflow input that needs a file
             workflow_name: Name of the current workflow
-            auto_fill_threshold: Minimum score to auto-fill (default 4.0)
+            auto_fill_threshold: Minimum score to auto-fill (default 3.0)
 
         Returns:
             Best matching file info, or None if no confident match

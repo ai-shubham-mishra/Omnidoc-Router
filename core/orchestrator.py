@@ -1372,8 +1372,8 @@ class RouterOrchestrator:
                         best_score = score
                         best_file = file_meta
                 
-                # Only auto-assign if score is above threshold (4.0 = confident match)
-                threshold = 4.0
+                # Only auto-assign if score is above threshold (3.0 = confident match)
+                threshold = 3.0
                 if best_file and best_score >= threshold:
                     file_value = [best_file["file_id"]]
                     await self.sessions.mark_input_collected(

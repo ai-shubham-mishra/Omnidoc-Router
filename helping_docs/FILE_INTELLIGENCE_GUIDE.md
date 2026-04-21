@@ -162,6 +162,7 @@ Response:
 | File Name | Detected Type | Confidence | Keywords |
 |-----------|---------------|------------|----------|
 | `SAMPLE_PO.pdf` | purchase_order | 95% | purchase, order, po, procurement |
+| `Delivery_Note.pdf` | delivery_note | 95% | delivery, note, shipping, dispatch |
 | `John_Doe_Card.jpg` | business_card | 92% | business, card, contact, lead |
 | `Invoice_12345.pdf` | invoice | 98% | invoice, billing, payment |
 | `Resume_Jane.pdf` | resume | 88% | resume, cv, candidate, experience |
@@ -183,9 +184,10 @@ When determining if a file should auto-fill an input, the system scores it:
 | **Already used by workflow** | -3.0 | File used by a completed workflow |
 | **Status is "used"** | -2.0 | File marked as used |
 
-**Auto-fill threshold:** Score ≥ 4.0
+**Auto-fill threshold:** Score ≥ 3.0
 
 **Example Scores:**
+- Perfect match (new delivery note for Invoice Gen): **8.5** ✅ Auto-fill
 - Perfect match (new business card for HubSpot): **9.5** ✅ Auto-fill
 - Wrong type (PO for business card input): **-7.0** ❌ Ask user
 - Reusing old file: **1.0** ❌ Ask user (below threshold)
