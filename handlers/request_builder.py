@@ -114,13 +114,17 @@ class RequestBuilder:
         """
         Build HITL confirmation request (call1) using workflow schema.
         
-        Generic implementation:
-        - Reads call1 schema from workflow to get field mappings
-        - Extracts fields from confirmation_data['body']
-        - Maps internal field names to API parameter names via endpoint_field_name
-        - Always includes: is_confirmed_by_user, runId, workflowId
+        Supports TWO patterns for backward compatibility:
         
-        Always JSON for confirmations.
+        1. NEW PATTERN (POWorkflow, ReconciliationWorkflow):
+           - Sends entire confirmation_data under "confirmed_data" key
+           - Preserves nested structure like body.validated_po
+           
+        2. OLD PATTERN (RSCWorkflow):
+           - Sends flattened fields at root level (payloadBexio, po_number, etc.)
+           - For backward compatibility
+        
+        Strategy: Send BOTH patterns so all workflows work!
         """
         endpoint = workflow.get("workflowEndpoint", "")
         schema = workflow.get("workflowSchema", {})
@@ -128,7 +132,6 @@ class RequestBuilder:
         body_data = call1.get("body_data", {})
         
         # Build field mapping from call1 schema
-        # Maps internal field names (Input0, Input1) to API parameter names
         field_mapping = {}
         for field_name, field_config in body_data.items():
             api_field = field_config.get("endpoint_field_name", field_name)
@@ -141,28 +144,33 @@ class RequestBuilder:
             "workflowId": workflow_id,
         }
         
-        # Extract fields from confirmation_data.body and map to API parameter names
+        # NEW PATTERN: Send entire confirmation_data under "confirmed_data"
+        # This preserves nested structures like body.validated_po
+        if confirmation_data:
+            payload["confirmed_data"] = confirmation_data
+        
+        # OLD PATTERN: Also flatten fields for backward compatibility
+        # Extract and map individual fields from confirmation_data.body
         if confirmation_data:
             body = confirmation_data.get("body", {})
             
             # Map each field from body using the field_mapping
             for internal_field, value in body.items():
-                # Skip if value is None or empty
+                # Skip if value is None
                 if value is None:
                     continue
                 
                 # Get API parameter name from mapping
                 api_field = field_mapping.get(internal_field, internal_field)
                 
-                # Special handling: if api_field is one of the core fields, use it directly
-                if api_field in ["is_confirmed_by_user", "runId", "workflowId"]:
-                    # Already set above, skip
+                # Skip core fields (already set above)
+                if api_field in ["is_confirmed_by_user", "runId", "workflowId", "confirmed_data"]:
                     continue
                 
-                # Add to payload with API parameter name
+                # Add flattened field for backward compatibility with RSCWorkflow
                 payload[api_field] = value
             
-            # Also check if confirmation_data has direct fields (fallback for old format)
+            # Also extract direct fields from confirmation_data root (fallback)
             for key in ["payloadBexio", "po_number", "user_id", "org_id"]:
                 if key in confirmation_data and key not in payload:
                     payload[key] = confirmation_data[key]

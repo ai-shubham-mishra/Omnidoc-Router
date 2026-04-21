@@ -1127,7 +1127,7 @@ class RouterOrchestrator:
                         url,
                         data=form_data,
                         files=files_list if files_list else None,
-                        headers={"Authorization": request_data["headers"]["Authorization"]},
+                        headers=request_data["headers"],  # Pass ALL headers including X-Session-Id
                     )
 
                     # Close file handles
