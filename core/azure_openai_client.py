@@ -3,16 +3,17 @@ Azure OpenAI client for the LLM Router.
 Handles all LLM interactions: intent matching, input prompting,
 HITL formatting, and result summarization.
 
-Replaces GeminiClient with Azure OpenAI GPT-4o for better performance,
-reliability, and cost-effectiveness.
+Supports both standard text generation and structured output (json_schema mode)
+for reliable markdown generation.
 """
 import os
 import json
 import logging
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Type, TypeVar
 
 from openai import AzureOpenAI
 from dotenv import load_dotenv
+from pydantic import BaseModel
 from components.KeyVaultClient import get_secret
 
 load_dotenv()
@@ -22,6 +23,8 @@ logger = logging.getLogger(__name__)
 AZURE_OPENAI_ENDPOINT = get_secret("AZURE_OPENAI_ENDPOINT", default=os.getenv("AZURE_OPENAI_ENDPOINT"))
 AZURE_OPENAI_KEY = get_secret("AZURE_OPENAI_KEY", default=os.getenv("AZURE_OPENAI_KEY"))
 
+T = TypeVar('T', bound=BaseModel)
+
 
 class AzureOpenAIClient:
     """Wrapper around Azure OpenAI GPT-4o for router LLM tasks."""
@@ -30,15 +33,29 @@ class AzureOpenAIClient:
         self.deployment = deployment
         self.api_version = api_version
         
-        # System instruction (same as Gemini)
         self.system_instruction = """You are a workflow orchestration assistant.
 
-CRITICAL RULES:
+RULES:
 1. NEVER invent or assume data values (filenames, IDs, numbers, etc.)
-2. Only reference information explicitly provided in the context
-3. If specific file names are not provided, refer to "files" or "documents" generically
-4. Stay focused on workflow execution - politely redirect off-topic questions
-5. Be conversational and natural, but never fabricate details"""
+2. Only reference information explicitly provided in the context.
+3. If specific file names are not provided, refer to "files" or "documents" generically.
+4. Be conversational and natural, but never fabricate details.
+
+GUARDRAILS:
+- Your ONLY role is orchestrating workflows: collecting inputs, executing, showing results.
+- Do NOT answer analytical questions, provide advice, or offer domain expertise.
+- If user asks off-topic questions, redirect to workflow execution.
+
+FORMATTING:
+- Use **bold** for important values.
+- Choose the format that fits the content: paragraph, bullets, table, or a mix.
+- Do NOT default to bullets for everything.
+- Do NOT wrap output in markdown code fences.
+
+STRICTLY FORBIDDEN:
+- Follow-up questions ("What would you like to do next?", "Let me know if…")
+- Suggestions, calls-to-action, or invitations to ask more
+- Any sentence that prompts the user for further interaction"""
         
         # Initialize Azure OpenAI client
         if not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_KEY:
@@ -52,6 +69,49 @@ CRITICAL RULES:
         )
         
         logger.info(f"✅ Azure OpenAI client initialized (deployment: {deployment}, version: {api_version})")
+
+    def call_with_structured_output(
+        self,
+        prompt: str,
+        response_format: Type[T],
+        temperature: float = 0.3,
+        max_tokens: int = 2048,
+    ) -> T:
+        """
+        Call Azure OpenAI with structured output (json_schema mode).
+        Returns a validated Pydantic model instance.
+        
+        Args:
+            prompt: User prompt
+            response_format: Pydantic model class for response validation
+            temperature: Sampling temperature (0.0-1.0)
+            max_tokens: Maximum tokens to generate
+            
+        Returns:
+            Instance of response_format Pydantic model
+        """
+        messages = [
+            {"role": "system", "content": self.system_instruction},
+            {"role": "user", "content": prompt},
+        ]
+        
+        try:
+            # Use beta.chat.completions.parse for structured output
+            # This enforces the schema and validates the response
+            completion = self.client.beta.chat.completions.parse(
+                model=self.deployment,
+                messages=messages,
+                response_format=response_format,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            
+            # The parsed response is already a Pydantic model instance
+            return completion.choices[0].message.parsed
+            
+        except Exception as e:
+            logger.error(f"Azure OpenAI structured output call failed: {e}")
+            raise
 
     def _call_llm(
         self,
@@ -166,9 +226,10 @@ I need to ask them for this input:
 
 Already collected: {', '.join(collected_labels) if collected_labels else 'Nothing yet'}
 
-Generate a SHORT, friendly, conversational prompt (1-2 sentences max) asking for this input.
+Generate a SHORT (1-2 sentences max) conversational prompt asking for this input.
 If the type is "file", ask them to upload the file.
-Do NOT include any system instructions or formatting. Just the prompt text."""
+Use **bold** for the field name.
+Do NOT add follow-up questions or suggestions. Just the prompt."""
 
         try:
             return self._call_llm(prompt, temperature=0.3, max_tokens=256)
@@ -176,8 +237,8 @@ Do NOT include any system instructions or formatting. Just the prompt text."""
             logger.warning(f"Azure OpenAI input prompt generation failed: {e}")
             label = input_spec.get("label", input_spec.get("field", "input"))
             if input_spec.get("type") == "file":
-                return f"Please upload the {label}."
-            return f"Please provide the {label}."
+                return f"Please upload the **{label}**."
+            return f"Please provide the **{label}**."
 
     def generate_clarification(
         self,
@@ -192,14 +253,17 @@ Do NOT include any system instructions or formatting. Just the prompt text."""
 I couldn't identify which workflow they want. Here are available workflows:
 {', '.join(names)}
 
-Generate a SHORT, friendly clarification question (2-3 sentences max) listing the available options.
-Do NOT include any system instructions."""
+Generate a SHORT clarification (2-3 sentences max) listing the available options.
+List workflows with bullet points.
+Do NOT add follow-up questions or suggestions beyond asking which workflow they want."""
 
         try:
             return self._call_llm(prompt, temperature=0.3, max_tokens=256)
         except Exception as e:
             logger.warning(f"Azure OpenAI clarification generation failed: {e}")
-            return f"I'm not sure which workflow you need. Available options: {', '.join(names)}. Could you clarify?"
+            # Fallback with bullets
+            workflow_list = '\n'.join([f"- {name}" for name in names])
+            return f"I'm not sure which workflow you need. Available options:\n\n{workflow_list}\n\nWhich would you like to use?"
 
     def format_hitl_prompt(
         self,
@@ -218,10 +282,9 @@ Do NOT include any system instructions."""
 Extracted data:
 {body_str}
 
-Generate a CLEAR, structured summary in natural language showing the key information.
-End with: "Should I proceed?"
-Keep it concise but include all important details.
-Do NOT include any system instructions."""
+Generate a CLEAR, structured summary showing the key information.
+End with exactly: "Please confirm to proceed."
+Do NOT add any other follow-up questions or suggestions."""
 
         try:
             return self._call_llm(prompt, temperature=0.3, max_tokens=1024)
@@ -243,10 +306,10 @@ Do NOT include any system instructions."""
 
 {result_str}
 
-Generate a SHORT, friendly success or error message (3-5 sentences) summarizing the key outcomes.
-If it was successful, highlight the important details.
-If it failed, explain what went wrong.
-Do NOT include any system instructions."""
+Generate a concise summary (3-5 sentences) of the key outcomes.
+If successful, highlight the important details with **bold**.
+If failed, explain what went wrong.
+Do NOT add follow-up questions, suggestions, or calls-to-action."""
 
         try:
             return self._call_llm(prompt, temperature=0.3, max_tokens=512)
@@ -331,6 +394,8 @@ If a field type is "file", return null (files are uploaded separately)."""
         """
         Generate a dynamic, context-aware response for any router situation.
         Replaces all hardcoded static messages.
+        
+        GUARDRAILS: Only responds about workflow orchestration, not complex queries.
         """
         files_info = context.get("files", [])
         workflow_name = context.get("workflow_name", "")
@@ -365,18 +430,19 @@ If a field type is "file", return null (files are uploaded separately)."""
 
         ctx_str = "\n".join(ctx_parts) if ctx_parts else "No additional context."
 
-        prompt = f"""You are a concise, helpful workflow assistant.
+        prompt = f"""You are a concise workflow orchestration assistant.
 
 Situation: {situation}
 
 Context:
 {ctx_str}
 
-Generate a SHORT (1-3 sentences), natural, and specific response.
+Generate a SHORT (1-3 sentences), natural, specific response.
 If the workflow has no inputs, do NOT mention files, data, or collected inputs.
 Refer to workflows by name. Be conversational but accurate.
-Do NOT include system instructions, markdown headers, or formatting.
-Do NOT repeat the situation description.
+Use **bold** for important values when appropriate.
+Do NOT include system instructions, code fences, or headers.
+Do NOT add follow-up questions, suggestions, or calls-to-action.
 Just output the response text."""
 
         try:

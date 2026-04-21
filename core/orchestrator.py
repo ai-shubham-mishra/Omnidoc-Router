@@ -21,6 +21,8 @@ from core.azure_openai_client import AzureOpenAIClient
 from core.session_manager import SessionManager
 from core.workflow_matcher import WorkflowMatcher
 from core.file_intelligence import FileIntelligence
+from core.result_analyzer import ResultAnalyzer
+from core.markdown_enhancer import MarkdownEnhancer
 from handlers.input_collector import InputCollector
 from handlers.request_builder import RequestBuilder
 from handlers.file_handler import FileHandler
@@ -65,6 +67,24 @@ class RouterOrchestrator:
         self.intent = IntentDetector()
         self.file_intel = FileIntelligence()
         self.file_middleware = file_middleware
+        
+        # New components for rich markdown responses
+        self.result_analyzer = ResultAnalyzer(self.gemini)
+        self.markdown_enhancer = MarkdownEnhancer()
+    
+    def _enhance_response(self, structured_response, context: Optional[Dict[str, Any]] = None):
+        """
+        Build perfect markdown from structured LLM response.
+        Uses MarkdownEnhancer to convert StructuredResponse to markdown string.
+        """
+        try:
+            return self.markdown_enhancer.build_from_structured(structured_response, context)
+        except Exception as e:
+            logger.warning(f"Markdown building failed: {e}")
+            # Fallback: if it's already a string, return it
+            if isinstance(structured_response, str):
+                return structured_response
+            return "Response formatting failed. Please try again."
     
     def _format_value_for_display(self, value: Any, input_type: str) -> str:
         """Format collected input value for safe LLM display."""
@@ -673,6 +693,9 @@ class RouterOrchestrator:
         if not matched:
             summaries = self.matcher.get_workflow_summaries(org_id)
             clarification = self.gemini.generate_clarification(message, summaries)
+            # Enhance markdown
+            clarification = self._enhance_response(clarification)
+            
             await self.sessions.add_message(session_id, "assistant", clarification)
             return RouterResponse(
                 session_id=session_id,
@@ -726,6 +749,9 @@ class RouterOrchestrator:
                 still_missing[0],
                 updated_inputs,
             )
+            # Enhance markdown
+            prompt = self._enhance_response(prompt)
+            
             await self.sessions.add_message(session_id, "assistant", prompt)
             await self.sessions.update_workflow_status(session_id, "collecting")
             
@@ -935,6 +961,9 @@ class RouterOrchestrator:
                 still_missing[0],
                 updated_inputs,
             )
+            # Enhance markdown
+            prompt = self._enhance_response(prompt)
+            
             await self.sessions.add_message(session_id, "assistant", prompt)
             
             # Get total session files count
@@ -1195,7 +1224,17 @@ class RouterOrchestrator:
                 confirmation_data=result,
             )
 
-            hitl_prompt = self.gemini.format_hitl_prompt(result, workflow_name)
+            # Use intelligent result analyzer instead of basic formatting
+            # Returns structured response for perfect markdown building
+            structured_hitl = self.result_analyzer.analyze_workflow_result(
+                result, 
+                workflow_name, 
+                result_type="hitl"
+            )
+            
+            # Build perfect markdown from structured output
+            hitl_prompt = self._enhance_response(structured_hitl)
+            
             await self.sessions.add_message(session_id, "assistant", hitl_prompt)
 
             return RouterResponse(
@@ -1237,20 +1276,34 @@ class RouterOrchestrator:
             )
             await self.sessions.update_files(session_id, updated_files)
         
-        # Generate result summary for future context/question answering
+        # Generate INTELLIGENT result summary using analyzer
+        # This reads the ENTIRE response and curates insights
+        # Returns structured response for perfect markdown building
+        structured_summary = self.result_analyzer.analyze_workflow_result(
+            result, 
+            workflow_name, 
+            result_type="final"
+        )
+        
+        # Build perfect markdown from structured output
+        summary = self._enhance_response(
+            structured_summary,
+            context={"workflow_type": workflow_name, "has_files": bool(result.get("file_outputs"))}
+        )
+        
+        # Also generate factual summary for history/RAG
         result_summary = self.gemini.generate_result_summary(result, workflow_name)
         
         await self.sessions.complete_workflow(
             session_id, result, status="completed", result_summary=result_summary
         )
         
-        summary = self.gemini.format_final_result(result, workflow_name)
         await self.sessions.add_message(session_id, "assistant", summary)
 
         return RouterResponse(
             session_id=session_id,
             status="idle",  # Back to idle for next workflow!
-            response=summary + "\n\nWhat would you like to do next?",
+            response=summary,
             workflow_identified=WorkflowIdentified(
                 id=workflow_id,
                 name=workflow_name,
