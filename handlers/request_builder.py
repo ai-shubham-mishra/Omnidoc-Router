@@ -4,7 +4,7 @@ Builds API requests (JSON or form-data) for workflow endpoints
 based on the workflowSchema body_type.
 """
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -107,82 +107,33 @@ class RequestBuilder:
         run_id: str,
         workflow_id: str,
         is_confirmed: bool,
-        confirmation_data: Dict[str, Any],
         jwt_token: str,
         session_id: str = None,
+        hitl_request: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Build HITL confirmation request (call1) using workflow schema.
-        
-        Supports TWO patterns for backward compatibility:
-        
-        1. NEW PATTERN (POWorkflow, ReconciliationWorkflow):
-           - Sends entire confirmation_data under "confirmed_data" key
-           - Preserves nested structure like body.validated_po
-           
-        2. OLD PATTERN (RSCWorkflow):
-           - Sends flattened fields at root level (payloadBexio, po_number, etc.)
-           - For backward compatibility
-        
-        Strategy: Send BOTH patterns so all workflows work!
+        Build HITL confirmation request with modified hitl_request from frontend.
+        Router provides runId from session, frontend provides edited hitl_request.
         """
         endpoint = workflow.get("workflowEndpoint", "")
-        schema = workflow.get("workflowSchema", {})
-        call1 = schema.get("call1", {})
-        body_data = call1.get("body_data", {})
         
-        # Build field mapping from call1 schema
-        field_mapping = {}
-        for field_name, field_config in body_data.items():
-            api_field = field_config.get("endpoint_field_name", field_name)
-            field_mapping[field_name] = api_field
-        
-        # Start with required fields
+        # Build payload with core fields
         payload = {
             "is_confirmed_by_user": is_confirmed,
-            "runId": run_id,
-            "workflowId": workflow_id,
+            "runId": run_id,  # Router-generated, from session
         }
         
-        # NEW PATTERN: Send entire confirmation_data under "confirmed_data"
-        # This preserves nested structures like body.validated_po
-        if confirmation_data:
-            payload["confirmed_data"] = confirmation_data
+        # Add modified hitl_request if provided by frontend
+        if hitl_request:
+            payload["hitl_request"] = hitl_request
         
-        # OLD PATTERN: Also flatten fields for backward compatibility
-        # Extract and map individual fields from confirmation_data.body
-        if confirmation_data:
-            body = confirmation_data.get("body", {})
-            
-            # Map each field from body using the field_mapping
-            for internal_field, value in body.items():
-                # Skip if value is None
-                if value is None:
-                    continue
-                
-                # Get API parameter name from mapping
-                api_field = field_mapping.get(internal_field, internal_field)
-                
-                # Skip core fields (already set above)
-                if api_field in ["is_confirmed_by_user", "runId", "workflowId", "confirmed_data"]:
-                    continue
-                
-                # Add flattened field for backward compatibility with RSCWorkflow
-                payload[api_field] = value
-            
-            # Also extract direct fields from confirmation_data root (fallback)
-            for key in ["payloadBexio", "po_number", "user_id", "org_id"]:
-                if key in confirmation_data and key not in payload:
-                    payload[key] = confirmation_data[key]
-        
-        logger.info(f"🔧 HITL confirmation request built: {list(payload.keys())}")
+        logger.info(f"🔧 HITL confirmation request: runId={run_id}, has_hitl_request={bool(hitl_request)}")
         
         headers = {
             "Authorization": jwt_token,
             "Content-Type": "application/json",
         }
         
-        # Add session_id to headers if provided
         if session_id:
             headers["X-Session-Id"] = session_id
         

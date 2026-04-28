@@ -109,18 +109,20 @@ class RouterOrchestrator:
         session_id: Optional[str],
         files: List = None,
         file_ids: List[str] = None,
+        hitl_request: Optional[Dict[str, Any]] = None,
         user_id: str = "",
         org_id: str = "",
         jwt_token: str = "",
     ) -> RouterResponse:
         """
         Unified message handler for conversational workflow orchestration.
-        Handles: chat messages, file uploads, file_ids, intent detection, multi-workflow sessions.
+        Handles: chat messages, file uploads, file_ids, HITL confirmation, intent detection, multi-workflow sessions.
         
         Key Features:
         - Accepts both raw files and file_ids
         - Files uploaded via middleware → file_ids stored in session
         - File_ids validated via middleware → stored in session
+        - Accepts hitl_request (edited HITL data from frontend) for confirmation flow
         - Explicit execution intent required
         - Multi-workflow support
         - Session persists across workflows
@@ -245,7 +247,8 @@ class RouterOrchestrator:
                         user_id=user_id, 
                         org_id=org_id, 
                         jwt_token=jwt_token,
-                        message=message
+                        message=message,
+                        hitl_request=hitl_request,
                     )
                 
                 elif intent == "delay":
@@ -422,6 +425,7 @@ class RouterOrchestrator:
         org_id: str,
         jwt_token: str,
         message: Optional[str] = None,
+        hitl_request: Optional[Dict[str, Any]] = None,
     ) -> RouterResponse:
         """Handle HITL confirmation (confirm/cancel)."""
         session = await self.sessions.get_session(session_id)
@@ -459,7 +463,7 @@ class RouterOrchestrator:
             await self.sessions.add_message(session_id, "user", message)
 
         request_data = self.builder.build_confirmation_request(
-            workflow, run_id, workflow_id, is_confirmed, confirmation_data, jwt_token, session_id,
+            workflow, run_id, workflow_id, is_confirmed, jwt_token, session_id, hitl_request,
         )
 
         url = f"{AGENTICAPI_BASE_URL}{request_data['endpoint']}"

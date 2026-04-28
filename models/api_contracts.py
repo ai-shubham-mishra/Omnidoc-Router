@@ -31,6 +31,7 @@ class ConfirmationRequest(BaseModel):
     session_id: str = Field(..., description="Session ID")
     action: str = Field(..., description="'confirm' or 'cancel'")
     message: Optional[str] = Field(None, description="Optional user message with confirmation")
+    hitl_request: Optional[Dict[str, Any]] = Field(None, description="Modified HITL request from frontend with readonly/editable structure")
 
 
 # ============== Response Models ==============

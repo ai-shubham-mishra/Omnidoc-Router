@@ -35,6 +35,8 @@ logging.basicConfig(
 logging.getLogger("azure").setLevel(logging.WARNING)
 logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
 
+logger = logging.getLogger(__name__)
+
 app = FastAPI(
     title="Omnidoc Router",
     description="LLM-powered conversational workflow orchestrator with Redis caching",
@@ -85,15 +87,17 @@ async def router_message(
     message: str = Form(""),
     files: List[UploadFile] = File([]),
     file_ids: Optional[str] = Form(None),
+    hitl_request: Optional[str] = Form(None),
     user_context: UserContext = Depends(get_current_user),
 ):
     """
     Unified endpoint for conversational workflow orchestration.
-    Accepts multipart/form-data with message + files + file_ids in single request.
+    Accepts multipart/form-data with message + files + file_ids + hitl_request in single request.
     
     - Send message to chat
     - Upload files to session context (files → middleware → file_ids)
     - Reference existing files via file_ids (for reruns, cross-workflow)
+    - Pass hitl_request (edited HITL data from frontend) for confirmation
     - Or all simultaneously
     
     Session ID Priority:
@@ -102,6 +106,8 @@ async def router_message(
     
     Returns error if no session_id provided.
     """
+    import json
+    
     user_id = user_context.user_id
     org_id = user_context.raw_payload.get("organizationId", "")
     jwt_token = request.headers.get("Authorization", "")
@@ -120,18 +126,32 @@ async def router_message(
     # Parse file_ids (comes as comma-separated string or JSON array)
     parsed_file_ids = []
     if file_ids:
-        import json
         try:
             parsed_file_ids = json.loads(file_ids) if file_ids.startswith('[') else file_ids.split(',')
             parsed_file_ids = [fid.strip() for fid in parsed_file_ids if fid.strip()]
         except:
             parsed_file_ids = []
+    
+    # Parse hitl_request (comes as JSON string in form-data)
+    parsed_hitl_request = None
+    if hitl_request:
+        try:
+            parsed_hitl_request = json.loads(hitl_request)
+            logger.info(f"📝 HITL request received from frontend: {len(str(hitl_request))} chars")
+        except json.JSONDecodeError as e:
+            logger.warning(f"⚠️ Failed to parse hitl_request: {e}")
+            return RouterResponse(
+                status="failed",
+                response="Invalid hitl_request format. Must be valid JSON.",
+                error=ErrorDetail(code="INVALID_HITL_REQUEST", message=f"JSON parse error: {str(e)}"),
+            )
 
     result = await router_orchestrator.handle_message(
         message=message,
         session_id=final_session_id,
         files=files if files else [],
         file_ids=parsed_file_ids,
+        hitl_request=parsed_hitl_request,
         user_id=user_id,
         org_id=org_id,
         jwt_token=jwt_token,
@@ -221,7 +241,7 @@ async def router_confirm(
     request: Request,
     user_context: UserContext = Depends(get_current_user),
 ):
-    """Confirm or cancel a HITL step. Session ID required."""
+    """Confirm or cancel a HITL step with optional modified hitl_request."""
     user_id = user_context.user_id
     org_id = user_context.raw_payload.get("organizationId", "")
     jwt_token = request.headers.get("Authorization", "")
@@ -244,6 +264,7 @@ async def router_confirm(
         org_id=org_id,
         jwt_token=jwt_token,
         message=body.message,
+        hitl_request=body.hitl_request,  # Pass modified HITL request from frontend
     )
     return result
 
