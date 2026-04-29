@@ -21,6 +21,7 @@ AZ_COSMOS_DB_NAME = get_secret("AZ_COSMOS_DB_NAME", default=os.getenv("AZ_COSMOS
 # ── Collection Names (Router-relevant) ──
 REGISTERED_WORKFLOWS_COLLECTION = get_secret("AZ_COSMOS_DB_REGISTERED_WORKFLOWS_COLLECTION", default="registeredWorkflows")
 CHAT_SESSIONS_COLLECTION = get_secret("AZ_COSMOS_DB_CHAT_SESSIONS_COLLECTION", default="chat_sessions")
+IDLE_WORKFLOWS_COLLECTION = "idle_workflows"  # New: For workflows awaiting files
 
 
 def get_db_client():

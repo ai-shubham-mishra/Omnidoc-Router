@@ -52,12 +52,14 @@ class IntentDetector:
         "go ahead", "go for it", "let's go", "okay proceed",
         "please proceed", "looks good", "create it", "do it",
         "make it", "process it", "of course",
+        "yes please", "yes go", "yes proceed", "yes switch",
+        "okay switch", "sure switch", "yes do it",
     ]
     
     # Single-word execute keywords (use word-boundary matching)
     EXECUTE_WORDS = [
         "proceed", "execute", "submit", "confirmed", "confirm",
-        "approved", "approve", "accept",
+        "approved", "approve", "accept", "yes", "okay", "sure", "yep", "yeah",
     ]
 
     # Session/context question patterns (need RAG-style answers)

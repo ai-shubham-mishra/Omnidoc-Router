@@ -86,6 +86,12 @@ class SessionManager:
             
             # File IDs for file-based workflow communication
             "file_ids": [],
+            
+            # Idle workflows awaiting files (NEW)
+            "idle_workflows": [],
+            
+            # Unassigned files (uploaded but not matched to workflow)
+            "unassigned_files": [],
         }
         
         # Write to MongoDB (source of truth)
@@ -482,4 +488,147 @@ class SessionManager:
                 }
                 for f in session.get("uploaded_files", [])
             ],
+            "idle_workflows": session.get("idle_workflows", []),
+            "unassigned_files": session.get("unassigned_files", []),
         }
+    
+    # ============== Idle Workflow Management ==============
+    
+    async def add_idle_workflow(self, session_id: str, idle_workflow_summary: Dict[str, Any]):
+        """
+        Add idle workflow reference to session.
+        
+        Args:
+            idle_workflow_summary: Lightweight summary from IdleWorkflowManager
+                {instance_id, workflow_name, status, missing_count, last_active}
+        """
+        self.collection.update_one(
+            {"_id": session_id},
+            {
+                "$push": {"idle_workflows": idle_workflow_summary},
+                "$set": {"last_active": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")},
+            }
+        )
+        
+        # Update Redis cache
+        updated_session = self.collection.find_one({"_id": session_id})
+        if updated_session:
+            await self.redis.set_session(session_id, updated_session)
+        
+        logger.info(f"💤 Idle workflow added to session: {idle_workflow_summary['workflow_name']}")
+    
+    async def update_idle_workflow_in_session(
+        self,
+        session_id: str,
+        instance_id: str,
+        updated_summary: Dict[str, Any]
+    ):
+        """Update idle workflow summary in session (e.g., after file added)."""
+        session = await self.get_session(session_id)
+        if not session:
+            return
+        
+        idle_workflows = session.get("idle_workflows", [])
+        updated_list = []
+        
+        for wf in idle_workflows:
+            if wf.get("instance_id") == instance_id:
+                updated_list.append(updated_summary)
+            else:
+                updated_list.append(wf)
+        
+        self.collection.update_one(
+            {"_id": session_id},
+            {
+                "$set": {
+                    "idle_workflows": updated_list,
+                    "last_active": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                }
+            }
+        )
+        
+        # Update Redis cache
+        updated_session = self.collection.find_one({"_id": session_id})
+        if updated_session:
+            await self.redis.set_session(session_id, updated_session)
+    
+    async def remove_idle_workflow_from_session(self, session_id: str, instance_id: str):
+        """Remove idle workflow from session (after execution or cancellation)."""
+        self.collection.update_one(
+            {"_id": session_id},
+            {
+                "$pull": {"idle_workflows": {"instance_id": instance_id}},
+                "$set": {"last_active": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")},
+            }
+        )
+        
+        # Update Redis cache
+        updated_session = self.collection.find_one({"_id": session_id})
+        if updated_session:
+            await self.redis.set_session(session_id, updated_session)
+        
+        logger.info(f"✅ Idle workflow removed from session: {instance_id[:8]}...")
+    
+    async def add_unassigned_file(self, session_id: str, file_info: Dict[str, Any]):
+        """
+        Add file to unassigned list (could not be matched to any idle workflow).
+        
+        Args:
+            file_info: {file_id, filename, uploaded_at, classification_attempted, confidence}
+        """
+        self.collection.update_one(
+            {"_id": session_id},
+            {
+                "$push": {"unassigned_files": file_info},
+                "$set": {"last_active": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")},
+            }
+        )
+        
+        # Update Redis cache
+        updated_session = self.collection.find_one({"_id": session_id})
+        if updated_session:
+            await self.redis.set_session(session_id, updated_session)
+        
+        logger.info(f"📂 Unassigned file added: {file_info.get('filename')}")
+    
+    async def remove_unassigned_file(self, session_id: str, file_id: str):
+        """Remove file from unassigned list (after manual assignment)."""
+        self.collection.update_one(
+            {"_id": session_id},
+            {
+                "$pull": {"unassigned_files": {"file_id": file_id}},
+                "$set": {"last_active": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")},
+            }
+        )
+        
+        # Update Redis cache
+        updated_session = self.collection.find_one({"_id": session_id})
+        if updated_session:
+            await self.redis.set_session(session_id, updated_session)
+    
+    async def update_session(self, session_id: str, updates: Dict[str, Any]):
+        """
+        Generic method to update arbitrary session fields.
+        Useful for storing temporary state like pending_workflow_switch.
+        
+        Args:
+            session_id: Session identifier
+            updates: Dictionary of fields to update
+        """
+        if not updates:
+            return
+        
+        # Add last_active timestamp
+        updates["last_active"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        
+        self.collection.update_one(
+            {"_id": session_id},
+            {"$set": updates}
+        )
+        
+        # Update Redis cache
+        updated_session = self.collection.find_one({"_id": session_id})
+        if updated_session:
+            await self.redis.set_session(session_id, updated_session)
+        
+        logger.debug(f"📝 Session updated: {list(updates.keys())}")

@@ -13,6 +13,7 @@ import os
 import uuid
 import logging
 import httpx
+from datetime import datetime
 from typing import Dict, Any, Optional, List
 
 from dotenv import load_dotenv
@@ -68,6 +69,12 @@ class RouterOrchestrator:
         self.file_intel = FileIntelligence()
         self.file_middleware = file_middleware
         
+        # Idle workflow components
+        from core.idle_workflow_manager import IdleWorkflowManager
+        from core.file_classifier import FileClassifier
+        self.idle_manager = IdleWorkflowManager()
+        self.file_classifier = FileClassifier()
+        
         # New components for rich markdown responses
         self.result_analyzer = ResultAnalyzer(self.gemini)
         self.markdown_enhancer = MarkdownEnhancer()
@@ -77,13 +84,15 @@ class RouterOrchestrator:
         Build perfect markdown from structured LLM response.
         Uses MarkdownEnhancer to convert StructuredResponse to markdown string.
         """
+        # If already a string, return as-is (no enhancement needed)
+        if isinstance(structured_response, str):
+            return structured_response
+        
+        # Try to enhance structured response
         try:
             return self.markdown_enhancer.build_from_structured(structured_response, context)
         except Exception as e:
             logger.warning(f"Markdown building failed: {e}")
-            # Fallback: if it's already a string, return it
-            if isinstance(structured_response, str):
-                return structured_response
             return "Response formatting failed. Please try again."
     
     def _format_value_for_display(self, value: Any, input_type: str) -> str:
@@ -194,7 +203,26 @@ class RouterOrchestrator:
             if deleted:
                 logger.debug(f"🗑️ Cleared Redis cache for session: {session_id[:8]}...")
 
-        # 3. Add message to conversation (if provided)
+        # 3D. PRIORITY: Try to match files to idle workflows FIRST
+        #     This handles files uploaded for workflows awaiting inputs
+        if all_file_ids:
+            temp_session = await self.sessions.get_session(session_id)
+            idle_workflows_summary = temp_session.get("idle_workflows", [])
+            
+            if idle_workflows_summary:
+                logger.info(f"🔍 {len(all_file_ids)} file(s) uploaded, {len(idle_workflows_summary)} idle workflows detected")
+                classification_result = await self._handle_file_classification(
+                    session_id=session_id,
+                    new_file_ids=all_file_ids,
+                    idle_workflows_summary=idle_workflows_summary,
+                    conversation_context=temp_session.get("conversation_history", [])
+                )
+                
+                # If files were matched to idle workflows, return classification result
+                if classification_result and classification_result.get("matched_count", 0) > 0:
+                    return classification_result["response"]
+
+        # 3E. Add message to conversation (if provided)
         if message:
             await self.sessions.add_message(session_id, "user", message)
 
@@ -234,8 +262,84 @@ class RouterOrchestrator:
         
         # 5. State machine routing
         if wf_status == "awaiting_confirmation":
-            # Check if user is confirming/canceling via text message
+            # WORKFLOW SWITCHING: Check if user wants to switch during HITL
             if message:
+                # First check if trying to switch workflows
+                idle_workflows = await self.idle_manager.get_idle_workflows(session_id=session_id)
+                resume_match = await self._detect_resume_intent(message, idle_workflows) if idle_workflows else None
+                
+                if resume_match:
+                    # User wants to resume another workflow while in HITL
+                    logger.info(f"🔄 Resume request during HITL: {current_wf.get('workflow_name')} → {resume_match['workflow_name']}")
+                    
+                    # Save current HITL workflow to idle
+                    current_workflow_idle_id = await self._save_current_workflow_to_idle(
+                        session_id=session_id,
+                        current_wf=current_wf,
+                        user_id=user_id,
+                        org_id=org_id
+                    )
+                    
+                    if current_workflow_idle_id:
+                        logger.info(f"💤 HITL workflow saved as idle: {current_workflow_idle_id[:8]}...")
+                    
+                    # Resume the requested workflow
+                    return await self._resume_idle_workflow(
+                        session_id=session_id,
+                        instance_id=resume_match["instance_id"],
+                        workflow_name=resume_match["workflow_name"],
+                        user_id=user_id,
+                        org_id=org_id,
+                        jwt_token=jwt_token,
+                        files_uploaded=files_uploaded
+                    )
+                
+                # Check for new workflow intent
+                new_workflow_match = self.matcher.match_by_keywords(message, org_id)
+                if not new_workflow_match:
+                    all_workflows = self.matcher.get_all_workflows(org_id)
+                    new_workflow_match = self.gemini.match_intent_to_workflow(message, all_workflows)
+                
+                if new_workflow_match and new_workflow_match.get("workflowId") != current_wf.get("workflow_id"):
+                    logger.info(f"🔍 New workflow detected during HITL: {new_workflow_match.get('workflowName')}")
+                    
+                    # Save current HITL workflow and offer switch
+                    current_workflow_idle_id = await self._save_current_workflow_to_idle(
+                        session_id=session_id,
+                        current_wf=current_wf,
+                        user_id=user_id,
+                        org_id=org_id
+                    )
+                    
+                    if current_workflow_idle_id:
+                        logger.info(f"💤 HITL workflow saved for potential switch: {current_workflow_idle_id[:8]}...")
+                    
+                    # Store pending switch
+                    await self.sessions.update_session(session_id, {
+                        "pending_workflow_switch": {
+                            "from_workflow_id": current_wf.get("workflow_id"),
+                            "to_workflow": new_workflow_match,
+                            "detected_at": datetime.utcnow().isoformat(),
+                            "from_state": "awaiting_confirmation"
+                        }
+                    })
+                    
+                    # Ask for confirmation
+                    switch_prompt = self.gemini.generate_contextual_response(
+                        f"User wants to switch from '{current_wf.get('workflow_name')}' (in confirmation) to '{new_workflow_match.get('workflowName')}'. Ask if they want to pause and switch.",
+                        {"will_pause": True}
+                    )
+                    await self.sessions.add_message(session_id, "assistant", switch_prompt)
+                    
+                    return RouterResponse(
+                        session_id=session_id,
+                        status="awaiting_confirmation",
+                        response=switch_prompt,
+                        requires_confirmation=True,
+                        files_uploaded=files_uploaded if files_uploaded else None,
+                    )
+                
+                # Not switching - check normal HITL intent
                 intent = self.intent.detect_execution_intent(message)
                 
                 if intent == "execute":
@@ -373,10 +477,216 @@ class RouterOrchestrator:
 
         # 6. Handle idle or collecting states
         if wf_status == "idle":
+            # Check if user wants to resume an idle workflow before matching new workflow
+            if message:
+                idle_workflows = await self.idle_manager.get_idle_workflows(session_id=session_id)
+                if idle_workflows:
+                    # Check if message indicates resuming an idle workflow
+                    resume_match = await self._detect_resume_intent(message, idle_workflows)
+                    if resume_match:
+                        return await self._resume_idle_workflow(
+                            session_id=session_id,
+                            instance_id=resume_match["instance_id"],
+                            workflow_name=resume_match["workflow_name"],
+                            user_id=user_id,
+                            org_id=org_id,
+                            jwt_token=jwt_token,
+                            files_uploaded=files_uploaded
+                        )
+            
             # No active workflow - match new intent
             return await self._identify_workflow_v2(session_id, message, user_id, org_id, files_uploaded)
 
         elif wf_status in ("collecting", "ready_to_execute"):
+            # WORKFLOW SWITCHING: Check if user is trying to start a NEW workflow
+            # before continuing with input collection for current workflow
+            if message:
+                # First check if there's a pending workflow switch
+                pending_switch = session.get("pending_workflow_switch")
+                
+                if pending_switch:
+                    logger.info(f"📋 Pending workflow switch detected: {pending_switch.get('from_workflow_id', '')[:8]}... → {pending_switch.get('to_workflow', {}).get('workflowName', '')}")
+                
+                # Try to match the message to a different workflow
+                new_workflow_match = self.matcher.match_by_keywords(message, org_id)
+                if not new_workflow_match:
+                    all_workflows = self.matcher.get_all_workflows(org_id)
+                    new_workflow_match = self.gemini.match_intent_to_workflow(message, all_workflows)
+                
+                # Log workflow matching attempt
+                if new_workflow_match:
+                    logger.info(f"🔍 Detected workflow intent: {new_workflow_match.get('workflowName')} (current: {current_wf.get('workflow_name')})")
+                
+                # If matched a different workflow, ask user if they want to switch
+                if new_workflow_match and new_workflow_match.get("workflowId") != current_wf.get("workflow_id"):
+                    current_wf_name = current_wf.get("workflow_name", "current workflow")
+                    new_wf_name = new_workflow_match.get("workflowName", "new workflow")
+                    
+                    # Generate switching confirmation message (emphasize workflow will be paused, not canceled)
+                    switch_prompt = self.gemini.generate_contextual_response(
+                        f"User wants to switch from '{current_wf_name}' to '{new_wf_name}'. Ask if they want to pause current workflow and start new one. Mention they can return to paused workflow later.",
+                        {
+                            "current_workflow": current_wf_name,
+                            "new_workflow": new_wf_name,
+                            "status": wf_status,
+                            "will_pause": True  # Emphasize it's a pause, not cancel
+                        }
+                    )
+                    
+                    await self.sessions.add_message(session_id, "assistant", switch_prompt)
+                    
+                    # Store the pending workflow switch in session for next interaction
+                    await self.sessions.update_session(session_id, {
+                        "pending_workflow_switch": {
+                            "from_workflow_id": current_wf.get("workflow_id"),
+                            "to_workflow": new_workflow_match,
+                            "detected_at": datetime.utcnow().isoformat()
+                        }
+                    })
+                    
+                    return RouterResponse(
+                        session_id=session_id,
+                        status=wf_status,
+                        response=switch_prompt,
+                        workflow_identified=WorkflowIdentified(
+                            id=current_wf.get("workflow_id", ""),
+                            name=current_wf_name,
+                            endpoint=current_wf.get("workflow_endpoint", ""),
+                        ),
+                        files_uploaded=files_uploaded if files_uploaded else None,
+                    )
+                
+                # Check if user is confirming a pending workflow switch
+                pending_switch = session.get("pending_workflow_switch")
+                if pending_switch:
+                    intent = self.intent.detect_execution_intent(message)
+                    logger.info(f"🎯 Intent detection for '{message}': {intent} (pending switch exists)")
+                    
+                    if intent == "execute":
+                        # User confirmed the switch
+                        logger.info(f"✅ Workflow switch confirmed: {pending_switch['from_workflow_id']} → {pending_switch['to_workflow']['workflowId']}")
+                        
+                        # Save current workflow to idle state (don't cancel it!)
+                        current_workflow_idle_id = await self._save_current_workflow_to_idle(
+                            session_id=session_id,
+                            current_wf=current_wf,
+                            user_id=user_id,
+                            org_id=org_id
+                        )
+                        
+                        if current_workflow_idle_id:
+                            logger.info(f"💤 Current workflow saved as idle: {current_workflow_idle_id[:8]}...")
+                        
+                        # Clear current workflow context and pending switch
+                        await self.sessions.update_session(session_id, {
+                            "current_workflow": {
+                                "status": "idle",
+                                "workflow_id": None,
+                                "workflow_name": None,
+                                "workflow_endpoint": None,
+                                "required_inputs": [],
+                                "collected_inputs": {},
+                            },
+                            "pending_workflow_switch": None
+                        })
+                        
+                        # Start the new workflow
+                        new_workflow = pending_switch["to_workflow"]
+                        required_inputs = self.collector.parse_workflow_inputs(new_workflow)
+                        required_inputs = self.collector.auto_fill_inputs(
+                            required_inputs,
+                            {"user_id": user_id, "org_id": org_id},
+                        )
+                        
+                        await self.sessions.set_workflow_context(session_id, new_workflow, required_inputs)
+                        
+                        # Auto-collect file inputs if any files in session
+                        session = await self.sessions.get_session(session_id)
+                        file_ids = session.get("file_ids", [])
+                        if file_ids:
+                            await self._recheck_all_inputs(session_id, session)
+                            session = await self.sessions.get_session(session_id)
+                        
+                        # Check what inputs are still needed
+                        current_wf = session.get("current_workflow", {})
+                        updated_inputs = current_wf.get("required_inputs", [])
+                        still_missing = self.collector.get_missing_inputs(updated_inputs)
+                        
+                        if still_missing:
+                            prompt = self.gemini.generate_input_prompt(
+                                new_workflow.get("workflowName", ""),
+                                still_missing[0],
+                                updated_inputs,
+                            )
+                            prompt = self._enhance_response(prompt)
+                            await self.sessions.add_message(session_id, "assistant", prompt)
+                            await self.sessions.update_workflow_status(session_id, "collecting")
+                            
+                            return RouterResponse(
+                                session_id=session_id,
+                                status="collecting",
+                                response=prompt,
+                                workflow_identified=WorkflowIdentified(
+                                    id=new_workflow.get("workflowId", ""),
+                                    name=new_workflow.get("workflowName", ""),
+                                    endpoint=new_workflow.get("workflowEndpoint", ""),
+                                ),
+                                inputs_required=[
+                                    InputRequired(
+                                        field=inp["field"],
+                                        type=inp.get("type", "str"),
+                                        label=inp.get("label", ""),
+                                        collected=inp.get("collected", False),
+                                    )
+                                    for inp in updated_inputs
+                                ],
+                                files_uploaded=files_uploaded if files_uploaded else None,
+                            )
+                        else:
+                            # All inputs collected for new workflow
+                            await self.sessions.update_workflow_status(session_id, "ready_to_execute")
+                            prompt = self.gemini.generate_contextual_response(
+                                f"Workflow '{new_workflow.get('workflowName', '')}' is ready. Ask user to confirm execution.",
+                                {"workflow_name": new_workflow.get("workflowName", "")},
+                            )
+                            await self.sessions.add_message(session_id, "assistant", prompt)
+                            
+                            return RouterResponse(
+                                session_id=session_id,
+                                status="ready_to_execute",
+                                response=prompt,
+                                workflow_identified=WorkflowIdentified(
+                                    id=new_workflow.get("workflowId", ""),
+                                    name=new_workflow.get("workflowName", ""),
+                                    endpoint=new_workflow.get("workflowEndpoint", ""),
+                                ),
+                                files_uploaded=files_uploaded if files_uploaded else None,
+                            )
+                    
+                    elif intent == "delay":
+                        # User canceled the switch
+                        logger.info(f"🛑 Workflow switch canceled")
+                        await self.sessions.update_session(session_id, {"pending_workflow_switch": None})
+                        
+                        # Continue with current workflow
+                        response = self.gemini.generate_contextual_response(
+                            f"Continuing with '{current_wf.get('workflow_name', 'current workflow')}'.",
+                            {"workflow_name": current_wf.get("workflow_name", "")},
+                        )
+                        await self.sessions.add_message(session_id, "assistant", response)
+                        
+                        return RouterResponse(
+                            session_id=session_id,
+                            status=wf_status,
+                            response=response,
+                            workflow_identified=WorkflowIdentified(
+                                id=current_wf.get("workflow_id", ""),
+                                name=current_wf.get("workflow_name", ""),
+                                endpoint=current_wf.get("workflow_endpoint", ""),
+                            ),
+                            files_uploaded=files_uploaded if files_uploaded else None,
+                        )
+            
             # Continue collecting or execute if ready
             return await self._collect_inputs_v2(
                 session_id, message, user_id, org_id, jwt_token, files_uploaded
@@ -1178,18 +1488,27 @@ class RouterOrchestrator:
 
         except Exception as e:
             logger.error(f"Workflow execution failed: {e}")
+            import traceback
+            traceback.print_exc()
+            
             await self.sessions.update_workflow_status(session_id, "failed")
             
-            # Move to history and reset to idle
+            # Move to history and reset to idle (preserves session file_ids)
             await self.sessions.complete_workflow(session_id, {"error": str(e)}, status="failed")
             
-            error_msg = "The workflow encountered an error during execution."
+            # Get session to include file count even on failure
+            session = await self.sessions.get_session(session_id)
+            session_files_count = len(session.get("file_ids", [])) if session else 0
+            
+            error_msg = "The workflow encountered an error during execution. Your files and session data are preserved."
             await self.sessions.add_message(session_id, "assistant", error_msg)
+            
             return RouterResponse(
                 session_id=session_id,
                 status="idle",  # Back to idle for next workflow
                 response=error_msg,
                 error=ErrorDetail(code="EXECUTION_ERROR", message=str(e)),
+                total_session_files=session_files_count if session_files_count > 0 else None,
             )
 
         # Handle result
@@ -1558,3 +1877,496 @@ class RouterOrchestrator:
         )
         
         return context
+    
+    async def _handle_file_classification(
+        self,
+        session_id: str,
+        new_file_ids: List[str],
+        idle_workflows_summary: List[Dict[str, Any]],
+        conversation_context: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Classify uploaded files against idle workflows.
+        
+        Returns:
+            {
+                "matched_count": int,
+                "unmatched_count": int,
+                "response": RouterResponse
+            }
+        """
+        # Get full idle workflow details from IdleWorkflowManager
+        idle_workflows_full = []
+        for summary in idle_workflows_summary:
+            instance_id = summary.get("instance_id")
+            if instance_id:
+                full_wf = await self.idle_manager.get_idle_workflow(instance_id)
+                if full_wf:
+                    idle_workflows_full.append(full_wf)
+        
+        if not idle_workflows_full:
+            return None
+        
+        # Extract recent messages for context
+        recent_messages = []
+        for entry in conversation_context[-5:]:
+            if isinstance(entry, dict):
+                recent_messages.append(f"{entry.get('role', 'user')}: {entry.get('content', '')}")
+        
+        # Classify each file
+        matched_files = []
+        unmatched_files = []
+        
+        for file_id in new_file_ids:
+            classification = await self.file_classifier.classify_file(
+                file_id=file_id,
+                idle_workflows=idle_workflows_full,
+                conversation_context=recent_messages
+            )
+            
+            if classification["matched"] and classification["confidence"] >= 0.80:
+                # High confidence match - auto-assign
+                await self.idle_manager.add_file_to_idle_workflow(
+                    instance_id=classification["workflow_instance_id"],
+                    input_field=classification["input_field"],
+                    file_id=file_id
+                )
+                
+                matched_files.append({
+                    "file_id": file_id,
+                    "workflow_instance_id": classification["workflow_instance_id"],
+                    "workflow_name": next(
+                        (wf["workflow_name"] for wf in idle_workflows_full 
+                         if wf["instance_id"] == classification["workflow_instance_id"]),
+                        "Unknown"
+                    ),
+                    "input_field": classification["input_field"],
+                    "confidence": classification["confidence"]
+                })
+                
+                # Check if workflow is now complete
+                completeness = await self.idle_manager.check_if_complete(
+                    classification["workflow_instance_id"]
+                )
+                
+                if completeness["is_complete"]:
+                    # Workflow ready to execute
+                    await self.idle_manager.update_status(
+                        classification["workflow_instance_id"],
+                        "ready_to_execute"
+                    )
+                    logger.info(f"✅ Idle workflow now complete: {classification['workflow_instance_id'][:8]}...")
+            
+            elif classification["confidence"] >= 0.60:
+                # Medium confidence - add to matched but note ambiguity
+                matched_files.append({
+                    "file_id": file_id,
+                    "workflow_instance_id": classification.get("workflow_instance_id"),
+                    "confidence": classification["confidence"],
+                    "needs_confirmation": True,
+                    "candidates": classification.get("candidates", [])
+                })
+            else:
+                # Low confidence - unmatched
+                unmatched_files.append({
+                    "file_id": file_id,
+                    "confidence": classification["confidence"],
+                    "reason": classification.get("reasoning", "Could not match to any workflow")
+                })
+                
+                # Add to unassigned files in session
+                file_meta = self.file_middleware.get_files_metadata([file_id])
+                if file_meta:
+                    await self.sessions.add_unassigned_file(session_id, {
+                        "file_id": file_id,
+                        "filename": file_meta[0].get("original_name", "unknown"),
+                        "uploaded_at": file_meta[0].get("uploaded_at", ""),
+                        "classification_attempted": True,
+                        "confidence": classification["confidence"]
+                    })
+        
+        # Build response
+        if matched_files or unmatched_files:
+            response_parts = []
+            
+            if matched_files:
+                auto_matched = [f for f in matched_files if not f.get("needs_confirmation")]
+                if auto_matched:
+                    response_parts.append(f"✅ Matched {len(auto_matched)} file(s) to idle workflows:")
+                    for match in auto_matched:
+                        response_parts.append(f"  - {match['workflow_name']} (confidence: {match['confidence']:.0%})")
+                
+                needs_confirm = [f for f in matched_files if f.get("needs_confirmation")]
+                if needs_confirm:
+                    response_parts.append(f"\n❓ {len(needs_confirm)} file(s) have multiple possible matches. Please clarify:")
+                    # Add disambiguation logic here if needed
+            
+            if unmatched_files:
+                response_parts.append(f"\n❌ Could not match {len(unmatched_files)} file(s). Please specify which workflow they belong to.")
+            
+            response_text = "\n".join(response_parts)
+            await self.sessions.add_message(session_id, "assistant", response_text)
+            
+            return {
+                "matched_count": len([f for f in matched_files if not f.get("needs_confirmation")]),
+                "unmatched_count": len(unmatched_files),
+                "response": RouterResponse(
+                    session_id=session_id,
+                    status="files_classified",
+                    response=response_text
+                )
+            }
+        
+        return None
+    
+    async def _save_current_workflow_to_idle(
+        self,
+        session_id: str,
+        current_wf: Dict[str, Any],
+        user_id: str,
+        org_id: str
+    ) -> Optional[str]:
+        """
+        Save current workflow to idle state when user switches to a different workflow.
+        Preserves complete workflow state including HITL context, schema, and file_ids.
+        Allows user to resume this workflow later from exact same state.
+        
+        Returns:
+            instance_id of the created idle workflow, or None if failed
+        """
+        try:
+            workflow_id = current_wf.get("workflow_id")
+            workflow_name = current_wf.get("workflow_name")
+            workflow_endpoint = current_wf.get("workflow_endpoint")
+            wf_status = current_wf.get("status", "collecting")
+            
+            if not workflow_id or not workflow_name:
+                logger.warning("Cannot save workflow to idle - missing workflow info")
+                return None
+            
+            # Separate collected and missing inputs
+            required_inputs = current_wf.get("required_inputs", [])
+            collected_inputs = current_wf.get("collected_inputs", {})
+            
+            missing_inputs = []
+            for inp in required_inputs:
+                if not inp.get("collected"):
+                    # Build file_signature if this is a file input
+                    file_signature = None
+                    if inp.get("type") in ("file", "files"):
+                        # Try to extract file_signature from workflow schema
+                        workflow_schema = current_wf.get("workflow_schema", {})
+                        body_data = workflow_schema.get("call0", {}).get("body_data", {})
+                        field_schema = body_data.get(inp.get("field"), {})
+                        file_signature = field_schema.get("file_signature")
+                    
+                    missing_input = {
+                        "field": inp.get("field"),
+                        "inputLabel": inp.get("label", inp.get("field")),
+                        "inputType": inp.get("type", "str"),
+                        "inputSize": inp.get("size", 1),
+                        "already_collected": 0,
+                        "priority": inp.get("priority", "required")
+                    }
+                    
+                    if file_signature:
+                        missing_input["file_signature"] = file_signature
+                    
+                    missing_inputs.append(missing_input)
+            
+            # Build execution context to preserve complete state
+            execution_context = {
+                "original_status": wf_status,
+                "workflow_schema": current_wf.get("workflow_schema"),
+                "workflow_api_calls": current_wf.get("workflow_api_calls"),
+                "file_ids_in_use": current_wf.get("file_ids_in_use", []),
+                "required_inputs_full": required_inputs,  # Full input specs with types
+            }
+            
+            # If in HITL state, preserve HITL context
+            if wf_status == "awaiting_confirmation":
+                execution_context["confirmation_data"] = current_wf.get("confirmation_data")
+                execution_context["run_id"] = current_wf.get("run_id")
+                execution_context["hitl_request"] = current_wf.get("hitl_request")
+                logger.info(f"💤 Preserving HITL state for {workflow_name} (run_id: {execution_context.get('run_id', 'N/A')[:8]}...)")
+            elif wf_status == "ready_to_execute":
+                # Preserve that it was ready to execute
+                execution_context["was_ready"] = True
+            
+            # Determine idle status based on current status
+            idle_status = "idle_awaiting_confirmation" if wf_status == "awaiting_confirmation" else "idle_awaiting_files"
+            
+            # Create idle workflow entry
+            instance_id = await self.idle_manager.create_idle_workflow(
+                workflow_id=workflow_id,
+                workflow_name=workflow_name,
+                workflow_endpoint=workflow_endpoint,
+                user_id=user_id,
+                org_id=org_id,
+                session_id=session_id,
+                collected_inputs=collected_inputs,
+                missing_inputs=missing_inputs,
+                idle_source="workflow_switching",
+                execution_context=execution_context
+            )
+            
+            # Update the status to reflect HITL state if applicable
+            if idle_status != "idle_awaiting_files":
+                await self.idle_manager.update_status(instance_id, idle_status)
+            
+            # Add to session's idle_workflows summary
+            idle_summary = {
+                "instance_id": instance_id,
+                "workflow_name": workflow_name,
+                "status": idle_status,
+                "missing_count": len(missing_inputs),
+                "original_status": wf_status,
+                "last_active": datetime.utcnow().isoformat()
+            }
+            
+            await self.sessions.add_idle_workflow(session_id, idle_summary)
+            
+            logger.info(f"💤 Workflow saved to idle state: {workflow_name} (status: {wf_status} → {idle_status}, instance: {instance_id[:8]}...)")
+            return instance_id
+            
+        except Exception as e:
+            logger.error(f"Failed to save workflow to idle state: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    async def _detect_resume_intent(
+        self,
+        message: str,
+        idle_workflows: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, str]]:
+        """
+        Detect if user wants to resume an idle workflow.
+        Checks for keywords like "continue", "resume", "back to" + workflow name.
+        
+        Returns:
+            {instance_id, workflow_name} if match found, None otherwise
+        """
+        message_lower = message.lower()
+        
+        # Keywords indicating resume intent
+        resume_keywords = ["continue", "resume", "back to", "return to", "go back to", "switch back"]
+        
+        has_resume_keyword = any(keyword in message_lower for keyword in resume_keywords)
+        
+        if not has_resume_keyword:
+            return None
+        
+        # Try to match workflow name in message
+        for workflow in idle_workflows:
+            workflow_name = workflow.get("workflow_name", "").lower()
+            if workflow_name and workflow_name in message_lower:
+                return {
+                    "instance_id": workflow["instance_id"],
+                    "workflow_name": workflow["workflow_name"]
+                }
+        
+        # If only one idle workflow, assume user wants that one
+        if len(idle_workflows) == 1 and has_resume_keyword:
+            return {
+                "instance_id": idle_workflows[0]["instance_id"],
+                "workflow_name": idle_workflows[0]["workflow_name"]
+            }
+        
+        return None
+    
+    async def _resume_idle_workflow(
+        self,
+        session_id: str,
+        instance_id: str,
+        workflow_name: str,
+        user_id: str,
+        org_id: str,
+        jwt_token: str,
+        files_uploaded: List
+    ) -> RouterResponse:
+        """
+        Resume an idle workflow by loading its complete state and making it the active workflow.
+        Handles resumption from any state: collecting, ready_to_execute, or awaiting_confirmation (HITL).
+        """
+        try:
+            # Get full idle workflow details
+            idle_workflow = await self.idle_manager.get_idle_workflow(instance_id)
+            
+            if not idle_workflow:
+                response = f"Could not find idle workflow: {workflow_name}"
+                await self.sessions.add_message(session_id, "assistant", response)
+                return RouterResponse(
+                    session_id=session_id,
+                    status="idle",
+                    response=response
+                )
+            
+            # Get execution context to restore complete state
+            execution_context = idle_workflow.get("execution_context", {})
+            original_status = execution_context.get("original_status", "collecting")
+            
+            logger.info(f"🔄 Resuming {workflow_name} from status: {original_status}")
+            
+            # Reconstruct workflow object with full schema
+            workflow = {
+                "workflowId": idle_workflow["workflow_id"],
+                "workflowName": idle_workflow["workflow_name"],
+                "workflowEndpoint": idle_workflow["workflow_endpoint"],
+                "workflowSchema": execution_context.get("workflow_schema"),
+                "workflowApiCalls": execution_context.get("workflow_api_calls"),
+            }
+            
+            # Use full required_inputs from execution_context if available (preserves types, labels, etc.)
+            required_inputs = execution_context.get("required_inputs_full", [])
+            
+            # If not available, reconstruct from collected and missing
+            if not required_inputs:
+                collected_inputs = idle_workflow.get("collected_inputs", {})
+                
+                # Add collected inputs (marked as collected)
+                for field, value in collected_inputs.items():
+                    required_inputs.append({
+                        "field": field,
+                        "value": value,
+                        "collected": True,
+                        "type": "file" if isinstance(value, list) else "str",
+                        "label": field
+                    })
+                
+                # Add missing inputs (not collected)
+                for missing in idle_workflow.get("missing_inputs", []):
+                    required_inputs.append({
+                        "field": missing["field"],
+                        "label": missing.get("inputLabel", missing["field"]),
+                        "type": missing.get("inputType", "str"),
+                        "size": missing.get("inputSize", 1),
+                        "collected": False,
+                        "priority": missing.get("priority", "required")
+                    })
+            
+            # Auto-fill user/org inputs
+            required_inputs = self.collector.auto_fill_inputs(
+                required_inputs,
+                {"user_id": user_id, "org_id": org_id}
+            )
+            
+            # Set as current workflow
+            await self.sessions.set_workflow_context(session_id, workflow, required_inputs)
+            
+            # Restore file_ids_in_use if available
+            file_ids_in_use = execution_context.get("file_ids_in_use", [])
+            if file_ids_in_use:
+                logger.info(f"📎 Restoring {len(file_ids_in_use)} file_ids to workflow")
+            
+            # Check if this was in HITL state - restore HITL context
+            if original_status == "awaiting_confirmation":
+                confirmation_data = execution_context.get("confirmation_data")
+                run_id = execution_context.get("run_id")
+                hitl_request = execution_context.get("hitl_request")
+                
+                logger.info(f"✅ Resuming HITL workflow (run_id: {run_id[:8] if run_id else 'N/A'}...)")
+                
+                # Update session with HITL context
+                await self.sessions.update_session(session_id, {
+                    "current_workflow.status": "awaiting_confirmation",
+                    "current_workflow.confirmation_data": confirmation_data,
+                    "current_workflow.run_id": run_id,
+                    "current_workflow.hitl_request": hitl_request,
+                    "current_workflow.file_ids_in_use": file_ids_in_use
+                })
+                
+                # Remove from idle workflows
+                await self.idle_manager.delete_idle_workflow(instance_id)
+                await self.sessions.remove_idle_workflow_from_session(session_id, instance_id)
+                
+                # Generate HITL resume prompt
+                prompt = self.gemini.format_hitl_prompt(confirmation_data, workflow_name) if confirmation_data else "Please review the workflow data and confirm to proceed."
+                response = f"✅ Resumed **{workflow_name}** (awaiting confirmation).\n\n{prompt}"
+                await self.sessions.add_message(session_id, "assistant", response)
+                
+                return RouterResponse(
+                    session_id=session_id,
+                    status="awaiting_confirmation",
+                    response=response,
+                    requires_confirmation=True,
+                    workflow_identified=WorkflowIdentified(
+                        id=workflow["workflowId"],
+                        name=workflow_name,
+                        endpoint=workflow["workflowEndpoint"],
+                    ),
+                    files_uploaded=files_uploaded if files_uploaded else None,
+                )
+            
+            # Not in HITL - remove from idle workflows
+            await self.idle_manager.delete_idle_workflow(instance_id)
+            await self.sessions.remove_idle_workflow_from_session(session_id, instance_id)
+            
+            # Check what inputs are still needed
+            session = await self.sessions.get_session(session_id)
+            current_wf = session.get("current_workflow", {})
+            updated_inputs = current_wf.get("required_inputs", [])
+            still_missing = self.collector.get_missing_inputs(updated_inputs)
+            
+            if still_missing:
+                prompt = self.gemini.generate_input_prompt(
+                    workflow_name,
+                    still_missing[0],
+                    updated_inputs,
+                )
+                prompt = self._enhance_response(prompt)
+                response = f"✅ Resumed **{workflow_name}**.\n\n{prompt}"
+                await self.sessions.add_message(session_id, "assistant", response)
+                await self.sessions.update_workflow_status(session_id, "collecting")
+                
+                return RouterResponse(
+                    session_id=session_id,
+                    status="collecting",
+                    response=response,
+                    workflow_identified=WorkflowIdentified(
+                        id=workflow["workflowId"],
+                        name=workflow_name,
+                        endpoint=workflow["workflowEndpoint"],
+                    ),
+                    inputs_required=[
+                        InputRequired(
+                            field=inp["field"],
+                            type=inp.get("type", "str"),
+                            label=inp.get("label", ""),
+                            collected=inp.get("collected", False),
+                        )
+                        for inp in updated_inputs
+                    ],
+                    files_uploaded=files_uploaded if files_uploaded else None,
+                )
+            else:
+                # All inputs collected - ready to execute
+                await self.sessions.update_workflow_status(session_id, "ready_to_execute")
+                prompt = self.gemini.generate_contextual_response(
+                    f"Resumed workflow '{workflow_name}' is ready. Ask user to confirm execution.",
+                    {"workflow_name": workflow_name},
+                )
+                response = f"✅ Resumed **{workflow_name}**. All inputs collected!\n\n{prompt}"
+                await self.sessions.add_message(session_id, "assistant", response)
+                
+                return RouterResponse(
+                    session_id=session_id,
+                    status="ready_to_execute",
+                    response=response,
+                    workflow_identified=WorkflowIdentified(
+                        id=workflow["workflowId"],
+                        name=workflow_name,
+                        endpoint=workflow["workflowEndpoint"],
+                    ),
+                    files_uploaded=files_uploaded if files_uploaded else None,
+                )
+                
+        except Exception as e:
+            logger.error(f"Failed to resume idle workflow: {e}")
+            response = f"Failed to resume {workflow_name}. Please try starting it fresh."
+            await self.sessions.add_message(session_id, "assistant", response)
+            return RouterResponse(
+                session_id=session_id,
+                status="idle",
+                response=response
+            )
