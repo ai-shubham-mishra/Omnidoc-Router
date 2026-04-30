@@ -317,10 +317,14 @@ class RouterOrchestrator:
                         # User confirmed the switch
                         logger.info(f"✅ Switch confirmed: {pending_switch['from_workflow_id'][:8]}... → {pending_switch['to_workflow']['workflowName']}")
                         
+                        # Extract triggering message for input extraction
+                        triggering_message = pending_switch.get("triggering_message")
+                        
                         # Clear pending switch
                         await self.sessions.update_session(session_id, {"pending_workflow_switch": None})
                         
                         # Use universal switch method (resumes from idle if exists)
+                        # ✅ Pass triggering message for input extraction
                         return await self._switch_to_workflow(
                             session_id=session_id,
                             target_workflow=pending_switch["to_workflow"],
@@ -329,7 +333,8 @@ class RouterOrchestrator:
                             jwt_token=jwt_token,
                             files_uploaded=files_uploaded,
                             save_current=False,  # Already saved when switch was initiated
-                            current_wf=None
+                            current_wf=None,
+                            triggering_message=triggering_message  # ✅ NEW: Pass message for input extraction
                         )
                     
                     elif intent == "delay":
@@ -429,6 +434,7 @@ class RouterOrchestrator:
                         logger.info(f"💤 HITL workflow saved with instance_id: {current_workflow_idle_id[:8]}...")
                     
                     # Store pending switch with idle workflow reference
+                    # ✅ OPTION 3: Store triggering message for input extraction after confirmation
                     await self.sessions.update_session(session_id, {
                         "pending_workflow_switch": {
                             "from_workflow_id": current_wf.get("workflow_id"),
@@ -436,7 +442,8 @@ class RouterOrchestrator:
                             "to_workflow": new_workflow_match,
                             "detected_at": datetime.utcnow().isoformat(),
                             "from_state": "awaiting_confirmation",
-                            "awaiting_user_confirmation": True  # Flag to indicate pending confirmation
+                            "awaiting_user_confirmation": True,  # Flag to indicate pending confirmation
+                            "triggering_message": message  # ✅ Store message for later input extraction
                         }
                     })
                     
@@ -654,11 +661,13 @@ class RouterOrchestrator:
                     await self.sessions.add_message(session_id, "assistant", switch_prompt)
                     
                     # Store the pending workflow switch in session for next interaction
+                    # ✅ OPTION 3: Store triggering message for input extraction after confirmation
                     await self.sessions.update_session(session_id, {
                         "pending_workflow_switch": {
                             "from_workflow_id": current_wf.get("workflow_id"),
                             "to_workflow": new_workflow_match,
-                            "detected_at": datetime.utcnow().isoformat()
+                            "detected_at": datetime.utcnow().isoformat(),
+                            "triggering_message": message  # ✅ Store message for later input extraction
                         }
                     })
                     
@@ -684,10 +693,14 @@ class RouterOrchestrator:
                         # User confirmed the switch
                         logger.info(f"✅ Workflow switch confirmed: {pending_switch['from_workflow_id']} → {pending_switch['to_workflow']['workflowId']}")
                         
+                        # Extract triggering message for input extraction
+                        triggering_message = pending_switch.get("triggering_message")
+                        
                         # Clear pending switch
                         await self.sessions.update_session(session_id, {"pending_workflow_switch": None})
                         
                         # Use universal switch method (resumes from idle if exists)
+                        # ✅ Pass triggering message for input extraction
                         return await self._switch_to_workflow(
                             session_id=session_id,
                             target_workflow=pending_switch["to_workflow"],
@@ -696,7 +709,8 @@ class RouterOrchestrator:
                             jwt_token=jwt_token,
                             files_uploaded=files_uploaded,
                             save_current=True,
-                            current_wf=current_wf
+                            current_wf=current_wf,
+                            triggering_message=triggering_message  # ✅ NEW: Pass message for input extraction
                         )
                     
                     elif intent == "delay":
@@ -2456,7 +2470,8 @@ class RouterOrchestrator:
         jwt_token: str,
         files_uploaded: List,
         save_current: bool = True,
-        current_wf: Optional[Dict[str, Any]] = None
+        current_wf: Optional[Dict[str, Any]] = None,
+        triggering_message: Optional[str] = None  # ✅ NEW: Message that triggered the switch
     ) -> RouterResponse:
         """
         Universal workflow switching handler - resumes from idle if exists, starts fresh if not.
@@ -2464,7 +2479,7 @@ class RouterOrchestrator:
         This is the SINGLE ENTRY POINT for all workflow switches, ensuring consistent behavior:
         - Checks if target workflow exists in idle_workflows database
         - If exists: loads complete state (collected_inputs, file_ids, HITL context)
-        - If not: starts fresh with empty state
+        - If not: starts fresh, optionally extracting inputs from triggering message
         - Generalizable across all workflow types and states
         
         Args:
@@ -2474,6 +2489,7 @@ class RouterOrchestrator:
             files_uploaded: Files uploaded in this request
             save_current: Whether to save current workflow to idle before switching
             current_wf: Current workflow context (for saving)
+            triggering_message: Optional message that triggered the switch (for input extraction)
         
         Returns:
             RouterResponse with appropriate status and prompts
@@ -2519,8 +2535,41 @@ class RouterOrchestrator:
                 {"user_id": user_id, "org_id": org_id}
             )
             
-            # Set workflow context with empty state
-            await self.sessions.set_workflow_context(session_id, target_workflow, required_inputs)
+            # ✅ OPTION 3: Extract inputs from triggering message if provided
+            collected_inputs = {}
+            if triggering_message:
+                logger.info(f"🔍 Extracting inputs from triggering message: '{triggering_message[:80]}...'")
+                missing_inputs = [inp for inp in required_inputs if not inp.get("collected")]
+                if missing_inputs:
+                    logger.info(f"📝 Missing inputs for extraction: {[inp['field'] for inp in missing_inputs]}")
+                    extracted = self.gemini.extract_inputs_from_message(
+                        triggering_message,
+                        missing_inputs
+                    )
+                    if extracted:
+                        logger.info(f"✅ Pre-extracted inputs from switch message: {extracted}")
+                        # Map extracted values to collected_inputs
+                        for inp in required_inputs:
+                            field = inp.get("field")
+                            if field in extracted and extracted[field]:
+                                inp["value"] = extracted[field]
+                                inp["collected"] = True
+                                collected_inputs[field] = extracted[field]
+                                logger.info(f"  ✓ {field} = {extracted[field]}")
+                    else:
+                        logger.info(f"⚠️ No inputs extracted from triggering message")
+                else:
+                    logger.info(f"✅ All inputs already collected, no extraction needed")
+            else:
+                logger.info(f"ℹ️ No triggering message provided, starting with empty inputs")
+            
+            # Set workflow context with pre-extracted inputs
+            await self.sessions.set_workflow_context(
+                session_id, 
+                target_workflow, 
+                required_inputs,
+                collected_inputs=collected_inputs if collected_inputs else None
+            )
             
             # Auto-collect file inputs if any files in session
             session = await self.sessions.get_session(session_id)
