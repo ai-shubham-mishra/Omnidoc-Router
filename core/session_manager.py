@@ -184,8 +184,18 @@ class SessionManager:
         session_id: str,
         workflow: Dict[str, Any],
         required_inputs: List[Dict[str, Any]],
+        collected_inputs: Optional[Dict[str, Any]] = None,
+        file_ids_in_use: Optional[List[str]] = None,
     ):
-        """Set current workflow being processed."""
+        """Set current workflow being processed.
+        
+        Args:
+            session_id: Session identifier
+            workflow: Workflow metadata (workflowId, workflowName, workflowSchema, etc.)
+            required_inputs: List of input specifications with collected status
+            collected_inputs: Pre-collected inputs (used when resuming workflows)
+            file_ids_in_use: File IDs used by this workflow (for restoration)
+        """
         wf_summary = {
             "workflow_id": workflow.get("workflowId", ""),
             "workflow_name": workflow.get("workflowName", ""),
@@ -194,10 +204,14 @@ class SessionManager:
             "workflow_api_calls": workflow.get("workflowApiCalls", {}),
             "status": "collecting",
             "required_inputs": required_inputs,
-            "collected_inputs": {},
+            "collected_inputs": collected_inputs if collected_inputs is not None else {},
             "run_id": None,
             "confirmation_data": None,
         }
+        
+        # Add file_ids_in_use if provided
+        if file_ids_in_use is not None:
+            wf_summary["file_ids_in_use"] = file_ids_in_use
 
         # Update MongoDB
         self.collection.update_one(

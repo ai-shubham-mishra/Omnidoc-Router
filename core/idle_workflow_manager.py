@@ -20,11 +20,12 @@ logger = logging.getLogger(__name__)
 
 
 class IdleWorkflowManager:
-    """Manages workflows in idle/waiting state."""
+    """Manages workflows in idle/waiting state with persistent status-based lifecycle."""
     
     COLLECTION_NAME = "idle_workflows"
     MAX_IDLE_WORKFLOWS_PER_SESSION = 10
     DEFAULT_TTL_DAYS = 7
+    ACTIVE_TTL_DAYS = 30  # Active workflows get longer TTL
     
     def __init__(self):
         self.client = MongoClient(AZ_COSMOS_DB_URL)
@@ -38,6 +39,7 @@ class IdleWorkflowManager:
             self.collection.create_index("session_id")
             self.collection.create_index([("session_id", 1), ("status", 1)])
             self.collection.create_index([("user_id", 1), ("status", 1)])
+            self.collection.create_index([("workflow_id", 1), ("session_id", 1)])
             self.collection.create_index("expires_at")  # TTL index
             logger.info("✅ Idle workflow indexes created")
         except Exception as e:
@@ -72,10 +74,37 @@ class IdleWorkflowManager:
         Returns:
             instance_id: Unique identifier for this idle workflow instance
         """
-        # Check session limit
+        # Check if this workflow already exists in idle state (from previous switch)
+        existing = self.collection.find_one({
+            "workflow_id": workflow_id,
+            "session_id": session_id,
+            "status": {"$in": ["idle_awaiting_files", "idle_mid_execution", "idle_awaiting_confirmation"]}
+        })
+        
+        if existing:
+            # Update existing instead of creating new
+            instance_id = existing["instance_id"]
+            logger.info(f"🔄 Updating existing idle workflow: {instance_id[:8]}... ({workflow_name})")
+            
+            self.collection.update_one(
+                {"instance_id": instance_id},
+                {
+                    "$set": {
+                        "collected_inputs": collected_inputs,
+                        "missing_inputs": missing_inputs,
+                        "execution_context": execution_context or {},
+                        "status": "idle_mid_execution" if idle_source == "mid_execution_discovery" else "idle_awaiting_files",
+                        "idle_source": idle_source,
+                        "last_active": datetime.utcnow().isoformat(),
+                    }
+                }
+            )
+            return instance_id
+        
+        # Check session limit for new workflows
         session_count = self.collection.count_documents({
             "session_id": session_id,
-            "status": {"$in": ["idle_awaiting_files", "idle_mid_execution"]}
+            "status": {"$in": ["idle_awaiting_files", "idle_mid_execution", "idle_awaiting_confirmation"]}
         })
         
         if session_count >= self.MAX_IDLE_WORKFLOWS_PER_SESSION:
@@ -121,10 +150,31 @@ class IdleWorkflowManager:
     async def get_idle_workflows(
         self,
         session_id: str,
-        include_expired: bool = False
+        include_expired: bool = False,
+        include_active: bool = False,
+        include_completed: bool = False
     ) -> List[Dict[str, Any]]:
-        """Get all idle workflows for a session."""
+        """Get idle workflows for a session, filtering by status.
+        
+        Args:
+            session_id: Session identifier
+            include_expired: Include expired workflows
+            include_active: Include workflows with status='active'
+            include_completed: Include workflows with status='completed'
+        
+        Returns:
+            List of idle workflow documents
+        """
         query = {"session_id": session_id}
+        
+        # Filter by status - exclude active and completed by default
+        status_filter = ["idle_awaiting_files", "idle_mid_execution", "idle_awaiting_confirmation"]
+        if include_active:
+            status_filter.append("active")
+        if include_completed:
+            status_filter.append("completed")
+        
+        query["status"] = {"$in": status_filter}
         
         if not include_expired:
             query["expires_at"] = {"$gt": datetime.utcnow().isoformat()}
@@ -142,6 +192,32 @@ class IdleWorkflowManager:
         workflow = self.collection.find_one({"instance_id": instance_id})
         if workflow:
             workflow.pop("_id", None)
+        return workflow
+    
+    async def find_idle_workflow_by_workflow_id(
+        self, 
+        session_id: str, 
+        workflow_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Find idle workflow for a session by workflow_id.
+        Used during workflow switching to check if target workflow exists in idle state.
+        
+        Args:
+            session_id: Session identifier
+            workflow_id: Workflow registry ID
+        
+        Returns:
+            Idle workflow document if found, None otherwise
+        """
+        workflow = self.collection.find_one({
+            "session_id": session_id,
+            "workflow_id": workflow_id,
+            "status": {"$in": ["idle_awaiting_files", "idle_awaiting_confirmation", "idle_mid_execution"]}
+        })
+        if workflow:
+            workflow.pop("_id", None)
+            logger.info(f"📍 Found existing idle workflow: {workflow['workflow_name']} (instance: {workflow['instance_id'][:8]}...)")
         return workflow
     
     async def add_file_to_idle_workflow(
@@ -278,12 +354,109 @@ class IdleWorkflowManager:
         )
         return result.modified_count > 0
     
+    async def activate_workflow(self, instance_id: str) -> bool:
+        """Mark workflow as active (currently being worked on).
+        
+        Active workflows get extended TTL and are excluded from idle queries.
+        This prevents accidental deletion while workflow is in progress.
+        """
+        now = datetime.utcnow()
+        new_expires_at = now + timedelta(days=self.ACTIVE_TTL_DAYS)
+        
+        result = self.collection.update_one(
+            {"instance_id": instance_id},
+            {
+                "$set": {
+                    "status": "active",
+                    "last_active": now.isoformat(),
+                    "expires_at": new_expires_at.isoformat(),
+                    "activated_at": now.isoformat()
+                }
+            }
+        )
+        
+        if result.modified_count > 0:
+            logger.info(f"▶️ Workflow activated: {instance_id[:8]}... (TTL extended to {self.ACTIVE_TTL_DAYS} days)")
+        return result.modified_count > 0
+    
+    async def deactivate_workflow(
+        self,
+        instance_id: str,
+        new_status: str = "idle_awaiting_files"
+    ) -> bool:
+        """Mark workflow as idle (paused/switched away from).
+        
+        Args:
+            instance_id: Workflow instance identifier
+            new_status: Status to set (idle_awaiting_files, idle_awaiting_confirmation, etc.)
+        
+        Returns:
+            True if successfully deactivated
+        """
+        result = self.collection.update_one(
+            {"instance_id": instance_id},
+            {
+                "$set": {
+                    "status": new_status,
+                    "last_active": datetime.utcnow().isoformat()
+                },
+                "$unset": {"activated_at": ""}
+            }
+        )
+        
+        if result.modified_count > 0:
+            logger.info(f"⏸️ Workflow deactivated: {instance_id[:8]}... (status: {new_status})")
+        return result.modified_count > 0
+    
     async def delete_idle_workflow(self, instance_id: str) -> bool:
-        """Delete/cancel an idle workflow."""
+        """Permanently delete an idle workflow.
+        
+        Only use this for:
+        - Workflow completion (success/failure)
+        - Explicit user cancellation
+        - TTL expiration cleanup
+        
+        Do NOT use for workflow switching - use deactivate_workflow() instead.
+        """
         result = self.collection.delete_one({"instance_id": instance_id})
         if result.deleted_count > 0:
             logger.info(f"🗑️ Idle workflow deleted: {instance_id[:8]}...")
         return result.deleted_count > 0
+    
+    async def delete_active_workflows(self, session_id: str) -> int:
+        """Delete all active workflows for a session.
+        
+        Called when a workflow completes - cleans up the active workflow.
+        
+        Returns:
+            Count of deleted workflows
+        """
+        result = self.collection.delete_many({
+            "session_id": session_id,
+            "status": "active"
+        })
+        
+        if result.deleted_count > 0:
+            logger.info(f"🗑️ Deleted {result.deleted_count} active workflow(s) for session {session_id[:8]}...")
+        return result.deleted_count
+    
+    async def extend_ttl(self, instance_id: str, days: int = None) -> bool:
+        """Extend TTL for a workflow (useful for long-running idle workflows)."""
+        if days is None:
+            days = self.DEFAULT_TTL_DAYS
+        
+        new_expires_at = datetime.utcnow() + timedelta(days=days)
+        
+        result = self.collection.update_one(
+            {"instance_id": instance_id},
+            {
+                "$set": {
+                    "expires_at": new_expires_at.isoformat(),
+                    "last_active": datetime.utcnow().isoformat()
+                }
+            }
+        )
+        return result.modified_count > 0
     
     async def cleanup_expired(self) -> int:
         """

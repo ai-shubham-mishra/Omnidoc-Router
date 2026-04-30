@@ -270,27 +270,46 @@ Do NOT add follow-up questions or suggestions beyond asking which workflow they 
         workflow_response: Dict[str, Any],
         workflow_name: str,
     ) -> str:
-        """Format HITL data into a natural language review prompt."""
-        body = workflow_response.get("body", workflow_response)
+        """Format HITL data into a natural language review prompt.
+        
+        Uses only data.message field to save tokens and avoid leaking sensitive data.
+        """
+        # ✅ FIX: Extract only data.message for LLM processing (token optimization)
+        message_for_llm = None
+        
+        # Priority 1: Use data.message if available (standardized field)
+        if isinstance(workflow_response, dict):
+            data_field = workflow_response.get("data", {})
+            if isinstance(data_field, dict) and "message" in data_field:
+                message_for_llm = data_field["message"]
+                logger.info(f"✅ Using data.message for HITL formatting (token-optimized)")
+        
+        # Priority 2: Fallback to top-level message
+        if not message_for_llm:
+            message_for_llm = workflow_response.get("message", "")
+            if message_for_llm:
+                logger.info(f"⚠️ Using top-level message for HITL formatting (data.message not found)")
+        
+        # Priority 3: Generate generic message if nothing available
+        if not message_for_llm:
+            logger.warning(f"⚠️ No message field found in HITL response, using generic message")
+            return f"The {workflow_name} workflow has data ready for your review. Please confirm to proceed."
 
-        body_str = json.dumps(body, indent=2, default=str)
-        if len(body_str) > 3000:
-            body_str = body_str[:3000] + "\n... (truncated)"
+        prompt = f"""You are a workflow assistant. The "{workflow_name}" workflow has data that needs user confirmation.
 
-        prompt = f"""You are a workflow assistant. The "{workflow_name}" workflow has extracted data that needs user confirmation.
+Workflow message:
+{message_for_llm}
 
-Extracted data:
-{body_str}
-
-Generate a CLEAR, structured summary showing the key information.
+Generate a CLEAR, concise summary showing the key information.
 End with exactly: "Please confirm to proceed."
-Do NOT add any other follow-up questions or suggestions."""
+Do NOT add any other follow-up questions or suggestions.
+Do NOT include any IDs or technical details."""
 
         try:
             return self._call_llm(prompt, temperature=0.3, max_tokens=1024)
         except Exception as e:
             logger.warning(f"Azure OpenAI HITL formatting failed: {e}")
-            return f"I've extracted the data for review. Please confirm to proceed or cancel."
+            return f"{message_for_llm}\n\nPlease confirm to proceed or cancel."
 
     def format_final_result(
         self,
